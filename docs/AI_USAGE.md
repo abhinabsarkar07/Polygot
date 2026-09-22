@@ -206,3 +206,82 @@ alternatives the checkpoint's own instructions raised, not proposed and
 then reversed -- recorded here because the tradeoff (documented in
 `docs/DESIGN.md`) is a real architectural choice worth being able to
 defend, not because anything was rejected.
+
+## CP-03 -- Anthropic, Gemini, and OpenAI adapters
+
+**Decision:** Rather than trust training-data knowledge of each SDK's
+streaming event names, exception hierarchy, and tool-call shapes (all
+things that change between SDK major versions), Claude installed the real
+pinned packages (`anthropic==1.7.0`, `openai==3.17.0`, `google-genai==2.24.0`)
+early and read their own source directly (`_exceptions.py`, the
+`openai/types/responses/*.py` type files, `google/genai/types.py`) for
+every field name and class this checkpoint's adapters depend on, rather
+than relying only on fetched documentation pages.
+
+**Review:** This caught real gaps a docs-only pass would likely have
+missed or gotten subtly wrong: Anthropic's exact exception class list (9
+distinct classes with the two-tier `PermissionDeniedError`/`AuthenticationError`
+split for 401 vs 403, not the generic pattern the docs page describes in
+prose); OpenAI's `ContentFilterFinishReasonError`/`LengthFinishReasonError`
+existing as real classes that are nonetheless *wrong* to catch in this
+adapter's error path (they're raised by a structured-output helper this
+adapter doesn't call); and, most concretely, that Gemini's SDK explicitly
+marks fragment-level tool-argument streaming ("`FunctionCall.partial_args`...
+This field is not supported in Gemini API") -- a fact load-bearing for
+`GeminiAdapter.stream()`'s behavior that no amount of generic "Gemini has
+function calling" documentation would have surfaced without reading the
+type definitions themselves.
+
+**Final:** All three adapters' streaming/error/tool-call logic is sourced
+from and cross-checked against the installed SDK's own code, cited by file
+in each adapter's module docstring and in `docs/PROVIDER_NOTES.md`.
+
+**Incident (self-caught, not user-flagged):** The first run of
+`test_anthropic_adapter.py`'s error-mapping tests failed six of seven
+cases with `ProviderErrorKind.UNKNOWN` instead of the expected specific
+kind. Cause: constructing a fake `anthropic.RateLimitError` (etc.) with
+`response=SimpleNamespace(headers={})` doesn't actually raise
+`RateLimitError` -- the exception class's own `__init__` reads
+`response.status_code` and `response.request`, neither present on the
+bare fake, so constructing it raised an unrelated `AttributeError` instead
+(which the adapter correctly, if unhelpfully, translated to `UNKNOWN` --
+technically correct behavior exposing an incorrect test double). Claude
+diagnosed this by reading `anthropic.APIStatusError.__init__`'s actual
+source rather than guessing, then fixed every affected test fixture to
+build a real `httpx.Response` (real status code, real request) instead of
+a hand-rolled stand-in.
+
+**Incident (self-caught, not user-flagged):** A first draft of the OpenAI
+streaming test used `event.item_id` at the `response.output_item.added`
+event, which doesn't carry that field (confirmed by re-reading
+`response_output_item_added_event.py`: it has `.item`, `.output_index`,
+not `.item_id`) -- an editing slip introduced while writing the adapter
+itself, not a bad assumption about the API. Caught and fixed before the
+test suite was ever run clean, by re-checking the source file the
+implementation was supposedly already based on.
+
+**Incident (self-caught, not user-flagged):** A test helper
+(`_part(**kwargs)` in `test_gemini_adapter.py`) passed `text=None,
+function_call=None` as `SimpleNamespace` defaults alongside `**kwargs`
+that could also contain `text=` or `function_call=`, raising `TypeError:
+got multiple values for keyword argument` the moment any test actually
+supplied one. Caught immediately by running the tests; fixed with
+`kwargs.setdefault(...)` instead of colliding positional defaults.
+
+**Accepted as generated, no correction needed:** the per-provider
+reconciliation decisions documented in `docs/PROVIDER_NOTES.md` and
+`docs/DESIGN.md` (Gemini's tool-result name lookup via request-scoped
+history rather than a CP-02 contract change; OpenAI's `item.id` vs.
+`item.call_id` correlation map; the three adapters' differently-shaped
+`_translate_error` methods) were designed and implemented as described,
+without a rejected first attempt -- each was informed directly by reading
+the installed SDK source before writing the corresponding adapter code,
+rather than being written first and corrected after.
+
+**Explicitly not done, and why:** no adapter was exercised against a real
+provider API in this checkpoint -- all three are fixture-tested only (see
+`docs/PROVIDER_NOTES.md`'s "Live- vs fixture-tested" note). This wasn't a
+credential-availability problem this time (CP-00 already flagged that
+possibility); it's simply what CP-03's own instructions call for ("Tests
+must NOT depend on paid/live APIs"). Recorded so this isn't mistaken for
+an oversight.

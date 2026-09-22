@@ -18,8 +18,9 @@ class Settings(BaseSettings):
     database_url: str
     frontend_origin: str = "http://localhost:5173"
 
-    # Reserved for CP-03+ (provider adapters). Declared here now so
-    # .env.example is complete and stable, but nothing in CP-01 reads them.
+    # Each is optional: app/providers/wiring.py only registers a provider
+    # adapter when its key is present, so a missing key means that one
+    # provider is unavailable, not that the app fails to start.
     anthropic_api_key: str | None = None
     gemini_api_key: str | None = None
     openai_api_key: str | None = None

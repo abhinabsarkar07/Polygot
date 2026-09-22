@@ -266,3 +266,95 @@ frontend, or any of `messages.py`/`contracts.py`/`errors.py`/`registry.py`
 -- if adding a real provider later turns out to require touching those,
 that's a sign the abstraction has a gap CP-03 needs to fix, not something
 to route around.
+
+## CP-03 Provider Adapter Boundary
+
+CP-03 built the three adapters the process above describes and proved it
+holds for real SDKs, not just the CP-02 fake provider.
+
+```
+Application (none exists yet -- CP-04)
+  -> CompletionRequest                            (app/providers/contracts.py)
+  -> ModelRegistry.get(internal model id)          (app/providers/models.py)
+  -> ProviderRegistry.get(model_config.provider)   (app/providers/registry.py,
+                                                      wired by app/providers/wiring.py)
+  -> Provider interface                            (app/providers/base.py)
+        |              |              |
+   Anthropic         Gemini         OpenAI
+    Adapter           Adapter        Adapter
+        |              |              |
+   anthropic SDK    google-genai   openai SDK
+   (Messages API)   (aio.models)   (Responses API)
+```
+
+and, for the response side:
+
+```
+Provider-native response/stream event
+  -> Adapter's _normalize_*() / _translate_error()
+  -> CompletionResponse / StreamEvent / ProviderError   (normalized)
+  -> Application
+```
+
+**Why provider-native types never cross the adapter boundary:** every
+adapter method that touches an SDK type (`anthropic.types.Message`,
+`openai.types.responses.Response`, `google.genai.types.GenerateContentResponse`,
+their respective streaming event unions, their respective exception
+hierarchies) is a private, adapter-local helper (`_build_request`,
+`_normalize_content`, `_translate_error`, ...). `complete()` and
+`stream()` -- the only public surface `Provider` defines -- are typed to
+return/yield only `CompletionResponse` and `StreamEvent`, both Pydantic
+models with no field capable of holding an arbitrary SDK object. There is
+structurally nowhere for a native type to leak into even by accident; the
+type checker (were one configured) or simply Pydantic validation at
+construction time would reject it.
+
+**Every provider's SDK shape earns its own adapter rather than a shared
+translation layer.** The three adapters were built independently, not by
+copying one and renaming variables (verified by how differently each
+`_translate_error` is *shaped*, not just parameterized -- see below), and
+the differences turned out to be real and adapter-boundary-appropriate,
+not application-level:
+
+- **Roles.** Anthropic and Gemini both collapse our `Role.TOOL` into
+  a `"user"`-equivalent message, but need different extra information to
+  do it (Gemini's `FunctionResponse` needs the function's *name*, recovered
+  by scanning the same request's own message history -- see
+  `docs/PROVIDER_NOTES.md`, Gemini "Message Format"). OpenAI's Responses
+  API needs no such collapsing at all -- tool results are their own item
+  type, `function_call_output`, referenced by id alone.
+- **Streaming granularity.** Anthropic and OpenAI both fragment tool-call
+  arguments across multiple delta events (and both require *not* parsing a
+  fragment as standalone JSON); Gemini's own SDK explicitly documents that
+  it does not do this at all, handing back one fully-parsed dict per call.
+  The Gemini adapter emits `ToolUseStartEvent` immediately followed by
+  `ToolUseCompleteEvent` with **no delta event between them**, reflecting
+  what the provider actually does rather than synthesizing a fake fragment
+  for uniformity.
+- **Error translation shape, not just error translation data.** Anthropic
+  and OpenAI both expose a typed exception subclass per HTTP status
+  (`AuthenticationError`, `RateLimitError`, ...), so each adapter's
+  `_translate_error` is an `isinstance` chain over distinct classes.
+  Gemini's SDK gives every HTTP error the same two classes
+  (`ClientError`/`ServerError`), both carrying a numeric `.code` -- so that
+  adapter's `_translate_error` is a status-code lookup instead. The
+  *normalized output* (`ProviderError(kind=...)`) is identical in shape
+  across all three; only the adapter-local code that produces it differs,
+  exactly where it's supposed to.
+- **Content filtering is finish-reason-level for all three providers, not
+  error-level**, discovered while building all three adapters rather than
+  assumed going in -- see `docs/PROVIDER_NOTES.md`'s cross-provider note
+  under Anthropic's "Important Quirks".
+
+**Credential-driven wiring, not application-level branching.**
+`app/providers/wiring.py::build_provider_registry` is the one place that
+knows all three concrete adapter classes by name -- a composition root,
+not application logic. It constructs and registers an adapter only when
+its API key is configured (`Settings.anthropic_api_key` etc., all
+`str | None`), so a missing key means that one provider is absent from the
+registry, not an application startup crash; selecting an absent provider
+later fails with the same `ProviderNotFoundError` CP-02 already defined
+for "unknown provider id". Not wired into `app/main.py` yet -- there's no
+chat service to hand the registry to until CP-04 -- so this is proven
+directly against the function (`tests/providers/test_wiring.py`) rather
+than only observable by booting the app.
