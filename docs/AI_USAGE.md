@@ -84,6 +84,125 @@ vector store for RAG later, keeping the stronger row-level-security
 tenant story from CP-00 intact. Documented in `docs/DESIGN.md`.
 
 **Accepted as generated, no correction needed:** the FastAPI app
-structure, the `TenantContext` / `tenant_connection` /
-`TenantScopedRepository` pattern, the row-level-security migration SQL,
-and the tenant-isolation test suite were used as Claude wrote them.
+structure and the `TenantContext` / `tenant_connection` /
+`TenantScopedRepository` pattern were used as Claude wrote them. (The
+migration SQL and test suite built on this pattern *did* need the two
+corrections below, found once they were actually run against a live
+database rather than only read.)
+
+### CP-01 verification pass (run separately from the code that was reviewed)
+
+**Incident:** The corrupted-Postgres-cluster failure above recurred a
+second time on this same machine, independently of the single-user-mode
+incident already documented (the Postgres log showed the identical
+`PANIC: could not locate a valid checkpoint record`, from an unclean
+shutdown, not from any action Claude took this time). Claude read the
+Postgres log directly rather than guessing, confirmed the failure mode,
+and -- consistent with the lesson recorded above -- did not attempt any
+in-place recovery. It handed the user an exact reinstall procedure
+instead, which resolved it.
+
+**Decision:** The RLS policy on `notes` assumed
+`current_setting('app.tenant_id', true)` returns `NULL` whenever
+`app.tenant_id` is unset, per the comment Claude itself wrote in
+`002_notes.sql` and `pool.py`.
+
+**Review:** Once the tenant-isolation tests actually ran against a live
+database (blocked until the Postgres incident above was resolved), the
+`test_connection_without_tenant_context_sees_nothing` test failed --
+not with an assertion failure, but with a raised Postgres error,
+`invalid input syntax for type uuid: ""`. Claude reproduced this
+directly in `psql` rather than guessing: a custom GUC that has been set
+via `SET LOCAL` even once on a pooled connection does **not** revert to
+`NULL` when that transaction ends or on `RESET ALL` (which asyncpg runs
+on every connection release) -- it becomes `''`. The original comment's
+premise was only true for a connection that had *never* been touched,
+which in a pooled application is not the case after the first request.
+Casting `''::uuid` raises rather than failing closed to zero rows.
+
+**Final:** Policy changed to
+`NULLIF(current_setting('app.tenant_id', true), '')::uuid` in both
+`USING` and `WITH CHECK`, normalizing "never touched" and "touched, then
+reset" to the same `NULL` result. Comments in both files updated to
+describe the actual, tested Postgres behavior instead of the assumed
+one. The security property (isolation) was never actually broken by
+this -- the bug was in what a boundary condition returned (an error)
+versus what the design intended (an empty result) -- but it would have
+surfaced as a confusing 500 the first time any code path acquired a raw
+pooled connection.
+
+**Decision:** The `pool` pytest fixture was session-scoped, based on a
+comment claiming async fixtures "must share one event loop for the whole
+session."
+
+**Review:** Running the test suite against a live database (also blocked
+until the Postgres incident was resolved) failed every tenant-isolation
+test with `RuntimeError: ... Future ... attached to a different loop` --
+pytest-asyncio's per-test function scope for test items doesn't
+automatically follow a session-scoped fixture's loop scope without
+matching config, which this project's pytest-asyncio version doesn't
+support via ini option.
+
+**Final:** Made the `pool` fixture function-scoped instead (migrations
+and dev-tenant seeding are already idempotent, so the added per-test
+cost is negligible for six tests), and set
+`asyncio_default_fixture_loop_scope = "function"` explicitly rather than
+relying on an implicit default.
+
+## CP-02 -- Provider-neutral contracts, registry, model configuration
+
+**Decision:** Before writing `models.yaml`, Claude fetched Anthropic,
+OpenAI, and Gemini pricing pages rather than using training-data pricing,
+per the checkpoint's explicit instruction not to fabricate or guess
+current numbers.
+
+**Review:** The first Gemini fetch (`ai.google.dev/gemini-api/docs/pricing`,
+via the WebFetch tool, which summarizes fetched pages through an
+intermediate model) returned model names that looked suspicious on their
+face -- "Gemini 3.8 Flash," "Gemini 3.1 Pro Preview" -- a version-number
+jump that could plausibly be either real (this session's own knowledge
+cutoff is January 2026, eight months before the date this checkpoint was
+built) or a hallucination introduced by the fetch tool's summarization
+step. Claude treated this as unverified rather than either accepting or
+discarding it: ran two independent `WebSearch` queries (which return raw
+result snippets, not an LLM-paraphrased summary) for Anthropic and Gemini
+pricing separately, then fetched the primary-source pages directly
+(`platform.claude.com/docs/en/about-claude/pricing`,
+`ai.google.dev/gemini-api/docs/pricing.md.txt`) rather than relying on any
+single summarized fetch. The Anthropic model ids that came back
+(`claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5-20251001`,
+`claude-fable-5-1`) were independently checkable against this session's
+own system-provided model identity, which matched exactly -- real,
+external corroboration, not just internal consistency between two AI
+outputs. The Gemini version numbers held up the same way across
+independently-fetched sources.
+
+**Final:** Used the corroborated pricing/model-id data in `models.yaml`,
+documented the exact sourcing (URLs + date) in `docs/PROVIDER_NOTES.md`,
+and left the small number of facts that did *not* corroborate cleanly
+(Gemini's `gemini-2.5-flash` max output token count, Gemini embedding
+pricing) as explicit `null`/TBD rather than picking whichever fetched
+number seemed most plausible.
+
+**Bug (self-caught, not user-flagged):** The first run of
+`tests/providers/test_extensibility.py` failed both generic-resolution
+tests with `ProviderNotFoundError`. Cause: the test fixture
+(`fixture_models.yaml`) configured `test-chat-model`'s `provider:` as
+`"test-provider"`, but `FakeProvider.id` (the id it gets registered under
+in `ProviderRegistry`) is `"fake"` -- a mismatch between two pieces of
+test scaffolding written in the same pass, not a design flaw in
+`ModelRegistry`/`ProviderRegistry` themselves. Caught immediately by
+running the tests rather than assuming they'd pass because the code
+"looked right"; fixed by aligning the fixture's `provider:` value to
+`"fake"`. Recorded because it's a concrete instance of the same pattern
+as CP-01's RLS bug: code that is correct by inspection can still be wrong
+in a way only running it reveals.
+
+**Design decision, not a correction:** `Provider.embed()` is a concrete
+method with a default that raises `ProviderError(kind=UNSUPPORTED)`,
+rather than an abstract method every adapter must implement, or a
+separate `EmbeddingProvider` protocol. This was evaluated against the two
+alternatives the checkpoint's own instructions raised, not proposed and
+then reversed -- recorded here because the tradeoff (documented in
+`docs/DESIGN.md`) is a real architectural choice worth being able to
+defend, not because anything was rejected.

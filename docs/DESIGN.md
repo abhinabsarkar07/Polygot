@@ -128,3 +128,141 @@ work and does not exist yet.
 - Use a proper migration tool once the schema grows past a handful of
   files (plain numbered `.sql` is fine for CP-01's one table).
 - Real authentication in place of the `X-Tenant-Id` header, as above.
+
+## CP-02 Provider Abstraction
+
+### The flow
+
+```
+Application (chat service, RAG service, API routes -- none exist yet)
+  -> internal model id, e.g. "claude-sonnet"           (a string the caller picks)
+  -> ModelRegistry.get(model_id)                        (app/providers/models.py)
+  -> ModelConfig(provider="anthropic", provider_model_id="claude-sonnet-5",
+                 context_window, capabilities, pricing)
+  -> ProviderRegistry.get(model_config.provider)         (app/providers/registry.py)
+  -> Provider (an ABC -- app/providers/base.py)
+  -> Adapter (CP-03; does not exist yet)                 e.g. AnthropicAdapter
+  -> provider.complete(request) / provider.stream(request)
+  -> CompletionResponse / AsyncIterator[StreamEvent]      (app/providers/contracts.py)
+```
+
+Application code only ever touches the last three normalized types
+(`CompletionRequest`, `CompletionResponse`/`StreamEvent`) and the two
+registries. It never imports `anthropic`, `google.genai`, or `openai`, and
+never branches on a provider name -- `if provider == "anthropic"` should
+not exist anywhere above the adapter layer, and a repository-wide grep
+confirms it doesn't (the only files mentioning provider names are
+`models.yaml` itself, the reserved `*_api_key` settings from CP-01, and
+docstrings explaining *why* the abstraction is shaped this way).
+
+### Why application code only depends on normalized types
+
+Two ids are kept deliberately separate everywhere in this layer:
+
+- **Internal model id** (`"claude-sonnet"`) -- what `CompletionRequest.model`
+  carries, what a future chat service and its API route deal in exclusively.
+- **Provider model id** (`"claude-sonnet-5"`) -- the literal string an
+  adapter sends upstream, resolved from `models.yaml` via `ModelConfig`.
+
+If application code carried provider model ids directly, renaming a model
+upstream (or repointing our "claude-sonnet" entry at a different Anthropic
+model entirely) would mean hunting down every place that string appears.
+Because only `models.yaml` and the adapter that reads `provider_model_id`
+off `ModelConfig` ever see it, that change is one line in one YAML file.
+
+The same reasoning extends to every other normalized type. `Message` /
+`ContentBlock` (`app/providers/messages.py`) represent what was said, not
+how Anthropic's content blocks, Gemini's `Part`, or OpenAI's Responses API
+content objects represent it -- that translation is entirely an adapter's
+job, in both directions (normalized request -> provider call, provider
+response/native exception -> normalized response/`ProviderError`).
+`StreamEvent` (seven flat, tagged event kinds in `contracts.py`, not one
+event with a dozen optional fields) is what a future SSE endpoint will
+serialize to the browser, regardless of which provider's streaming
+protocol produced the underlying tokens.
+
+### Two notable design decisions
+
+**Usage fields are `int | None`, not `int = 0`.** A provider that doesn't
+report `reasoning_tokens` at all and a provider that reports it *as* zero
+are different facts, and collapsing both to `0` would make them
+indistinguishable the moment a usage/cost dashboard (CP-06, if time
+allows) tries to build real numbers from this data. `None` means "not
+reported"; `0` means "reported, and it was zero." `PricingConfig` mirrors
+this for `cached_input_per_million`, which is `None` for Gemini right now
+specifically because its cached-input price isn't yet confirmed from an
+official source -- not because it's known to be free.
+
+**No cancellation field on `CompletionRequest`.** The assignment's
+TypeScript sketch implies an `AbortSignal`-shaped mechanism; Python
+already has one. Cancelling the `asyncio.Task` running a request is the
+idiomatic way to stop in-flight async work, and FastAPI already cancels
+the handling task when a client disconnects mid-stream. A well-behaved
+adapter's `await http_client.post(...)` unwinds on
+`asyncio.CancelledError` like any other awaited call, which is expected to
+propagate the cancellation to the underlying HTTP request without any
+extra plumbing. Forcing an `AbortSignal`-style field onto the request
+would duplicate a mechanism Python already has for free, and would be one
+more thing every adapter has to remember to check. This gets exercised for
+real in CP-04, once there's an actual SSE endpoint and a real adapter to
+cancel.
+
+### Embedding support: why `embed()` isn't abstract
+
+`Provider.complete()` and `Provider.stream()` are `@abstractmethod` --
+every provider must support chat. `embed()` is not: its base-class
+implementation raises `ProviderError(kind=UNSUPPORTED)`, and only
+providers that actually do embeddings override it. The alternative
+considered was a separate `EmbeddingProvider` protocol that only
+embedding-capable adapters implement; that's more statically type-safe,
+but it forces `ProviderRegistry` to hand back a union type and callers to
+`isinstance`-check before every embedding call -- exactly the kind of
+provider-shape branching this checkpoint exists to eliminate. The chosen
+design keeps one interface and one registry. A caller that wants to check
+ahead of time can (`model_config.capabilities.embeddings`); a caller that
+doesn't gets a normalized error instead of an `AttributeError` or a
+silent no-op.
+
+### `ProviderErrorKind.UNSUPPORTED`
+
+The assignment's required error categories are `auth`, `rate_limit`,
+`context_length`, `content_filter`, `timeout`, `server_error`,
+`bad_request`, plus `unknown` for safely handling unexpected upstream
+failures. `UNSUPPORTED` is an addition beyond that list, added because
+`embed()` needed a way to say "this provider/model doesn't do this at
+all" that's distinguishable from `BAD_REQUEST` (the request itself was
+malformed) -- calling `.embed()` on a chat-only provider isn't a malformed
+request, it's a capability mismatch.
+
+### Adding a provider (the target process, not yet proven end-to-end)
+
+CP-02's fake-provider test (`tests/providers/test_extensibility.py`)
+proves the *registry and interface* are provider-agnostic: a throwaway
+`FakeProvider` satisfies `Provider`, gets registered, and generic
+resolution code (`ModelRegistry.get` -> `ProviderRegistry.get` ->
+`provider.complete()`/`.stream()`) drives it with zero special-casing.
+CP-03 is what proves this works for a *real* SDK-backed provider; CP-07's
+interview prep will revisit whether it held up. Until then, the intended
+process for adding a provider is:
+
+1. Write one adapter class (`app/providers/<name>.py`, does not exist
+   yet) implementing `Provider` -- translate `CompletionRequest` to the
+   SDK's call shape, translate native responses/streaming events back to
+   `CompletionResponse`/`StreamEvent`, catch native exceptions and
+   re-raise `ProviderError`.
+2. Add an entry to `models.yaml` with real, sourced pricing (see
+   `docs/PROVIDER_NOTES.md`) and a `provider:` value matching the
+   adapter's `id`.
+3. Add the credential env var to `Settings` (`app/core/config.py`) and
+   `.env.example` if the adapter needs one.
+4. Register the adapter instance with `ProviderRegistry` wherever
+   providers get wired up at startup (does not exist yet -- CP-03/04).
+5. Write adapter-specific tests (request translation, response
+   translation, native-error-to-`ProviderError` mapping) alongside the
+   existing contract tests.
+
+No step touches a chat service, a RAG service, an API route, the
+frontend, or any of `messages.py`/`contracts.py`/`errors.py`/`registry.py`
+-- if adding a real provider later turns out to require touching those,
+that's a sign the abstraction has a gap CP-03 needs to fix, not something
+to route around.
