@@ -10,13 +10,14 @@ from app.api.collections import router as collections_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.api.models import router as models_router
+from app.api.usage import router as usage_router
 from app.core.config import get_settings
 from app.db.migrate import run_migrations
 from app.db.pool import create_pool
 from app.db.seed import ensure_dev_tenants
 from app.providers.models import ModelRegistry
 from app.providers.wiring import build_provider_registry
-from app.services.chat import ChatService
+from app.services.chat import ChatService, RetryConfig
 from app.services.embeddings import EmbeddingService
 from app.services.ingestion import IngestionService
 from app.services.retrieval import RetrievalService
@@ -53,7 +54,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     embedding_service = EmbeddingService(provider_registry, model_registry.get(EMBEDDING_MODEL_ID))
     retrieval_service = RetrievalService(embedding_service)
     app.state.ingestion_service = IngestionService(embedding_service)
-    app.state.chat_service = ChatService(model_registry, provider_registry, retrieval=retrieval_service)
+    app.state.chat_service = ChatService(
+        model_registry,
+        provider_registry,
+        retrieval=retrieval_service,
+        retry_config=RetryConfig(
+            max_retries=settings.retry_max_retries,
+            base_delay_seconds=settings.retry_base_delay_seconds,
+            max_delay_seconds=settings.retry_max_delay_seconds,
+        ),
+        timeout_seconds=settings.provider_request_timeout_seconds,
+    )
 
     yield
 
@@ -87,3 +98,4 @@ app.include_router(health_router, prefix="/api")
 app.include_router(models_router, prefix="/api")
 app.include_router(conversations_router, prefix="/api")
 app.include_router(collections_router, prefix="/api")
+app.include_router(usage_router, prefix="/api")

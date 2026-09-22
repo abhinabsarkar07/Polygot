@@ -66,7 +66,8 @@ export type StreamEvent =
   | { type: "usage"; usage: Record<string, number | null> }
   | { type: "done"; finish_reason: string }
   | { type: "error"; kind: string; message: string }
-  | { type: "sources"; sources: CitedSource[] };
+  | { type: "sources"; sources: CitedSource[] }
+  | { type: "fallback"; from_model: string; to_model: string };
 
 // --- RAG: collections and documents (CP-05) -------------------------------------
 

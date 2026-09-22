@@ -698,3 +698,168 @@ and reliability (a hint in a system prompt is a request, not a
 guarantee -- a model can still confidently answer from unrelated context
 it was told not to use; not calling it at all removes that failure mode
 entirely rather than mitigating it).
+
+## CP-06 Observability, Resilience, and Cost
+
+### Observability
+
+Every completed or interrupted turn writes exactly one `usage_records` row
+(`app/db/migrations/008_usage_records.sql`), tenant-scoped by the same
+FORCE-RLS pattern as every other table. It never stores prompt or response
+text -- only metadata: provider, requested vs. final model id (these
+differ only when fallback ran), TTFT, total latency, token counts (`None`
+when the provider didn't report a field, never coerced to `0`), cost,
+finish reason, retry count, and whether fallback was used. TTFT is
+measured as time-to-first-`TextDeltaEvent`, not time-to-first-byte of any
+kind -- a `UsageEvent` or a provider's own preamble arriving first doesn't
+count as "first token" for this metric. `GET /api/usage/summary`
+aggregates these per-provider (total cost, average latency, request
+count) inside a `tenant_connection`, so it's structurally impossible for
+one tenant's dashboard to include another's spend.
+
+### Cost Accounting
+
+`calculate_cost_usd` (`app/services/cost.py`) multiplies reported
+input/output tokens by `PricingConfig`'s per-million rates using `Decimal`
+throughout, quantized to 6dp with `ROUND_HALF_UP` -- binary float
+multiplication of fractional-cent unit prices accumulates visible error
+over many calls, which a stored dashboard figure can't afford.
+`cached_input_tokens` is deliberately **not** priced: Anthropic and OpenAI
+report cached-token accounting differently (additive vs. apparently a
+subset of `input_tokens`), and this was never confirmed against a live
+response before the time box closed. Pricing it wrong in either direction
+would silently corrupt a dollar figure someone might actually trust;
+leaving it unpriced is a stated, documented limitation, not a silent gap
+-- `Usage.cached_input_tokens` is still captured and persisted, just not
+folded into `cost_usd`. A turn with no `Usage` at all (deterministic
+no-evidence replies, a turn that failed before any usage was reported)
+gets `cost_usd = NULL`, distinct from a turn that really did cost $0.
+
+### Retry Policy
+
+`app/services/retry.py` is pure and deterministic: no sleeping, no
+provider calls, easy to unit-test exhaustively (`test_retry.py`).
+`RETRYABLE_KINDS = {rate_limit, server_error}` -- the two error kinds
+where retrying the identical request against the identical model is
+plausibly going to succeed. `auth`, `bad_request`, `context_length`, and
+`content_filter` are never retried: retrying an invalid request or a
+blocked request produces the same invalid/blocked result, just slower.
+Backoff is full-jitter exponential
+(`random.uniform(0, min(max_delay, base_delay * 2**(attempt-1)))`),
+configurable via `Settings` (`retry_max_retries`,
+`retry_base_delay_seconds`, `retry_max_delay_seconds`), defaulting to 2
+retries / 0.5s base / 8s ceiling.
+
+### Streaming Retry Safety Boundary
+
+Stated once, precisely, because it's the one rule this checkpoint cannot
+compromise on: **retry and fallback are only attempted while
+`accumulated_text == ""`.** The instant a real `TextDeltaEvent` has been
+yielded to the caller (and therefore already reached the browser),
+`ChatService.stream_reply` treats any subsequent failure as terminal --
+it surfaces a normalized `ErrorEvent` and stops, never retries the same
+model and never falls back to another one
+(`test_error_after_visible_output_is_never_transparently_retried`,
+`test_fallback_not_started_after_visible_output_from_primary`). Silently
+restarting generation after partial output has already streamed risks the
+user seeing duplicated, contradictory, or spliced text with no signal
+anything went wrong -- worse than just stopping and saying so. The
+partial text that did stream is still persisted, with `status =
+"interrupted"`, exactly like a user-cancelled turn (CP-04's cancellation
+persistence, extended in CP-06 to cover a mid-stream provider failure the
+same way).
+
+### Timeout
+
+Each individual attempt (`_stream_one_attempt`) is wrapped in
+`asyncio.timeout(self._timeout_seconds)` (`Settings.provider_request_timeout_seconds`,
+default 60s). A timeout cancels the in-flight `provider.stream()` call
+(Python's native cancellation, same mechanism CP-04's disconnect handling
+already relies on) and is normalized into `ProviderError(kind=TIMEOUT)` --
+from that point on it's just another error kind, eligible for fallback
+(`FALLBACK_ELIGIBLE_KINDS` includes `timeout`) but never for a same-model
+retry (retrying the exact call that just took too long is unlikely to
+finish faster the second time; falling back to a different model/provider
+is the more useful reaction). Tested with a fake provider that `HANG`s
+forever and a millisecond-scale `timeout_seconds`, so the test itself
+completes in under a second rather than actually waiting out a real
+timeout.
+
+### Fallback
+
+`ModelConfig.fallback_model_ids` (`models.yaml`) is a config-driven,
+priority-ordered list of internal model ids to try next -- never an
+`if provider == "anthropic": use gemini` in service code. `stream_reply`
+builds `candidate_ids = [primary, *fallback_model_ids]` and walks them in
+order; a fallback is only taken when the primary (or current candidate)
+fails with a `FALLBACK_ELIGIBLE_KIND` (`rate_limit`, `server_error`,
+`timeout`) *before any output*, and only when a next candidate exists.
+`auth`/`bad_request`/`context_length`/`content_filter` never trigger
+fallback either -- the same reasoning as retry: these are properties of
+the request or account, not the provider's momentary health, and a
+different provider won't fix a malformed or blocked request. A
+`FallbackEvent` (`{type: "fallback", from_model, to_model}`) is yielded
+the moment a fallback candidate is chosen, so the frontend can show an
+honest "this reply came from a different model" indicator
+(`MessageList.tsx`'s `fallback-badge`) rather than silently attributing
+the response to the model the user actually picked. The persisted
+`usage_records` row reflects reality: `requested_model_id` is what the
+user asked for, `final_model_id`/`provider` is what actually answered,
+`fallback_used = true`.
+
+### Security Review (STEP 19)
+
+No new infrastructure was added for this pass -- it's an audit of
+controls already in place plus a small addition (`MAX_MESSAGE_CHARS`).
+
+- **Secrets**: provider API keys live only in `Settings` (env-sourced),
+  never logged. Adapters log the raw upstream exception at `logger.debug`
+  server-side only (`anthropic stream error: %s`, etc.) -- CP-04 already
+  found live that `str(sdk_exception)` can embed the full response body,
+  which is exactly why `ProviderError.message`/`safe_message()` is what
+  ever reaches an `ErrorEvent`/the browser, never the raw exception text.
+- **Tenant isolation**: `usage_records` follows the same FORCE-RLS +
+  `tenant_connection` pattern as every other table; extended with an
+  adversarial cross-tenant test at both the service layer
+  (`test_tenant_a_can_never_see_tenant_bs_usage_summary`) and the API
+  layer (`test_usage_summary_never_leaks_across_tenants`).
+- **Provider errors**: confirmed (again) that only `safe_message(kind)`
+  strings reach `ErrorEvent`/SSE -- no raw adapter exception text or stack
+  trace is ever serialized to the client, retry/fallback included.
+- **Uploads**: unchanged from CP-05 -- extension allowlist (`.txt`,
+  `.md`, `.pdf`), non-empty check, and a hard byte-size ceiling
+  (`Settings.max_upload_bytes`) all enforced before any extraction work
+  starts.
+- **Prompt injection**: unchanged from CP-05 (see above) -- not
+  re-derived here, still a reduced-surface mitigation, not a guarantee.
+- **Input validation**: `SendMessageRequest.content` now has an explicit
+  `max_length` (`MAX_MESSAGE_CHARS = 20_000`,
+  `app/schemas/conversations.py`) -- previously unbounded, so an
+  arbitrarily large single message was both a cost and a request-size
+  vector. Conversation history length is already bounded by
+  `trim_to_context_window` (token-based, CP-04), which is a tighter and
+  more meaningful limit than an arbitrary message-count cap would have
+  been, so no separate cap was added.
+- **Cost-abuse controls -- honest gap**: `MAX_MESSAGE_CHARS`,
+  `DEFAULT_MAX_OUTPUT_TOKENS`, and `max_upload_bytes` bound the cost of
+  any *one* request, but there is no per-tenant rate limit or spend cap
+  across *many* requests -- a tenant (or a compromised/malicious
+  `X-Tenant-Id` value, since that header is unauthenticated by design,
+  see `app/core/tenant.py`) can send unlimited turns. The assignment's
+  explicit exclusion list rules out the obvious production answer here
+  (Redis-backed rate limiting), so this is recorded as a known,
+  deliberate gap rather than something quietly skipped -- see Production
+  Improvements below.
+
+### Production Improvements (not built, by design)
+
+Out of scope for a one-day take-home, listed here instead of silently
+omitted: per-tenant request-rate and spend limiting (needs shared state --
+Redis or equivalent, explicitly excluded); a real authentication layer
+behind `X-Tenant-Id`; alerting on elevated retry/fallback/timeout rates
+per provider; a circuit breaker that stops routing to a provider after
+repeated failures instead of retrying it on every single request; output-
+side prompt-injection filtering; distributed tracing across the
+retry/fallback chain (right now it's reconstructable from one
+`usage_records` row's `retry_count`/`fallback_used`/`final_model_id`, but
+not from per-attempt spans).

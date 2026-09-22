@@ -70,6 +70,11 @@ class ModelConfig(BaseModel):
     dimension: int | None = None
     capabilities: ModelCapabilities
     pricing: PricingConfig
+    # CP-06 fallback chain -- internal model ids only, in priority order,
+    # tried in sequence when an eligible error occurs before any visible
+    # output (see app/services/chat.py). Config-driven specifically so
+    # "which provider backs up which" is never an if/elif in service code.
+    fallback_model_ids: list[str] = []
 
 
 class ModelNotFoundError(LookupError):

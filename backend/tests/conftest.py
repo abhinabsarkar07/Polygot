@@ -21,7 +21,7 @@ async def pool():
 async def _clean_tables_between_tests(pool):
     yield
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE notes, messages, conversations, chunks, documents, collections")
+        await conn.execute("TRUNCATE notes, messages, usage_records, conversations, chunks, documents, collections")
 
 
 async def _tenant_by_slug(pool: asyncpg.Pool, slug: str) -> TenantContext:

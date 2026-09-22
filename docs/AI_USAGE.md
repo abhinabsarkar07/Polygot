@@ -473,3 +473,60 @@ the route as a generic 500, not the deliberate `failed`-status document
 STEP 14 calls for. Fixed before this was ever exercised by a real
 request with a missing key; confirmed by then actually removing the key
 and uploading a real file against the live server.
+
+## CP-06 -- Observability, cost accounting, retry, fallback, timeout
+
+**Self-caught bug, found via full-suite failure:** immediately after the
+`ChatService` rewrite that added `usage_records` persistence, the entire
+test suite showed "209 passed... 209 errors" -- including completely
+unrelated tests like `test_health.py`, which touches no chat logic at
+all. Root cause was in the shared teardown fixture, not the new code
+directly: `tests/conftest.py`'s autouse cleanup `TRUNCATE`d `notes,
+messages, conversations, chunks, documents, collections`, and the new
+migration added `usage_records` as a table with a foreign key *to*
+`conversations` -- so every single test's teardown hit
+`asyncpg.exceptions.FeatureNotSupportedError: cannot truncate a table
+referenced in a foreign key constraint`. This is the same class of
+mistake as CP-05's "hygiene debt" bug (a new table added without
+extending the shared cleanup statement) -- recorded again here rather
+than treated as fully learned, since it recurred with the exact same
+shape. Fixed by adding `usage_records` to the `TRUNCATE` list; confirmed
+with a full clean run (209/209, then 246/246 once the CP-06 test files
+were added).
+
+**Design correction, caught before it ever ran:** `Settings` initially
+grew two new fields, `max_message_chars: int` and
+`max_conversation_history_messages: int`, intended to be env-configurable
+like the rest of `Settings`. Applying the first one surfaced the actual
+problem: Pydantic's `Field(max_length=...)` on `SendMessageRequest.content`
+needs a value fixed at class-definition time, and a `Settings` instance
+only exists at runtime -- there is no clean way to make a Pydantic field
+constraint read from a `Settings()` instance without extra machinery not
+justified by the time box. Corrected by removing both fields from
+`Settings` and adding `MAX_MESSAGE_CHARS = 20_000` as a static module
+constant in `app/schemas/conversations.py` instead, matching the existing
+`MIN_TOP_K`/`MAX_TOP_K`/`MIN_CHUNK_SIZE`/`MAX_CHUNK_SIZE` pattern already
+in the codebase. `max_conversation_history_messages` was dropped
+entirely, not just relocated -- `trim_to_context_window` (CP-04) already
+bounds history by actual token budget, which is a more precise limit than
+an arbitrary message count would have added on top of it.
+
+**Self-caught bug, found immediately on first test run:** the first draft
+of `tests/test_usage_api.py` posted to `/api/conversations/{id}/messages`
+to drive a turn through the real API and produce a `usage_records` row --
+guessed from the shape of the URL rather than checked against
+`app/api/conversations.py`. The actual route (added in CP-04) is
+`/api/conversations/{id}/messages/stream`; the guessed path 404'd
+immediately. Caught by reading `app/api/conversations.py`'s router
+registration before re-running, not by trial and error against several
+guessed paths.
+
+**A note on scope, stated rather than left implicit:** cached-token cost
+pricing was deliberately left unimplemented (`Usage.cached_input_tokens`
+is captured but not priced -- see `docs/DESIGN.md`, "Cost Accounting")
+because Anthropic's and OpenAI's cached-token accounting semantics were
+never confirmed against a live response inside the time box, and a wrong
+guess in either direction would silently corrupt a dollar figure. This
+was a judgment call to leave a documented gap rather than invent a
+pricing rule, per the checkpoint's own explicit instruction not to guess
+here.

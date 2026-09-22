@@ -8,6 +8,10 @@ export interface DisplayMessage {
   status: "complete" | "interrupted" | "streaming";
   modelId?: string | null;
   sources?: CitedSource[];
+  // Set only when the primary model failed before any output and a
+  // configured fallback model (app/providers/models.yaml) took over --
+  // see app/services/chat.py's FallbackEvent.
+  fallbackFrom?: string;
 }
 
 interface Props {
@@ -43,6 +47,12 @@ export function MessageList({ messages }: Props) {
             {m.role}
             {m.modelId ? ` · ${m.modelId}` : ""}
             {m.status === "interrupted" && " · stopped"}
+            {m.fallbackFrom && (
+              <span className="fallback-badge" title={`${m.fallbackFrom} was unavailable; retried with ${m.modelId}`}>
+                {" "}
+                · fallback from {m.fallbackFrom}
+              </span>
+            )}
           </div>
           <div className="message-text">
             {m.text}

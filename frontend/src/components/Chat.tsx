@@ -76,6 +76,8 @@ export function Chat({ tenantId, conversationId, collectionId }: Props) {
           setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + event.text } : m)));
         } else if (event.type === "sources") {
           updateAssistant({ sources: event.sources });
+        } else if (event.type === "fallback") {
+          updateAssistant({ fallbackFrom: event.from_model, modelId: event.to_model });
         } else if (event.type === "done") {
           updateAssistant({ status: "complete" });
         } else if (event.type === "error") {

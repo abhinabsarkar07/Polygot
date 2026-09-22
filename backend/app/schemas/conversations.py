@@ -15,6 +15,15 @@ from pydantic import BaseModel, Field
 from app.providers.messages import ContentBlock
 from app.services.retrieval import DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_K, MAX_TOP_K, MIN_TOP_K
 
+# CP-06, STEP 20: a simple bound against an obviously-unbounded request
+# body, not a real token/cost budget (context-window trimming already
+# handles the token side -- see app/services/context_window.py). A static
+# module constant, like MIN_TOP_K/MAX_TOP_K below and chunking.py's
+# MIN/MAX_CHUNK_SIZE -- Pydantic's Field(max_length=...) needs a value at
+# class-definition time, which rules out driving it from runtime Settings
+# without real extra complexity this bound doesn't warrant.
+MAX_MESSAGE_CHARS = 20_000
+
 
 class CreateConversationRequest(BaseModel):
     title: str | None = None
@@ -41,7 +50,7 @@ class ConversationDetail(ConversationSummary):
 
 
 class SendMessageRequest(BaseModel):
-    content: str
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     # The browser's internal model id (e.g. "claude-sonnet"), resolved
     # server-side via ModelRegistry -- never a provider-native model
     # string. See app/services/chat.py::ChatService.prepare_turn.

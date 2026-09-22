@@ -16,6 +16,10 @@ models:
     provider_model_id: claude-sonnet-5
     context_window: 1000000
     max_output_tokens: 128000
+    # CP-06: if Anthropic is rate-limited/erroring/timing out before any
+    # output streams, retry this turn against Gemini instead of failing
+    # outright. One example fallback, not a claim every model needs one.
+    fallback_model_ids: [gemini-2.5-flash]
     capabilities:
       streaming: true
       tools: true

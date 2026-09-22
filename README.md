@@ -193,6 +193,36 @@ cd backend
 ./.venv/Scripts/python.exe -m pytest -v
 ```
 
+## Observability, cost, and resilience (CP-06)
+
+Every chat turn writes one usage record (provider, requested vs. final
+model, TTFT, total latency, token counts, cost, retry count, whether
+fallback ran) -- never prompt/response text. `GET /api/usage/summary`
+returns a tenant-scoped, per-provider rollup (total cost, average
+latency, request count).
+
+- **Retry**: `rate_limit` and `server_error` failures are retried against
+  the same model with full-jitter exponential backoff (configurable via
+  `RETRY_MAX_RETRIES` / `RETRY_BASE_DELAY_SECONDS` / `RETRY_MAX_DELAY_SECONDS`),
+  but **only before any reply text has streamed to the browser**. Once a
+  `TextDeltaEvent` has gone out, a later failure is surfaced as an error
+  and never silently retried or replaced.
+- **Fallback**: each model can configure a priority-ordered
+  `fallback_model_ids` list (`backend/app/providers/models.yaml`) --
+  `claude-sonnet` falls back to `gemini-2.5-flash`. A fallback is only
+  taken pre-output, for the same error kinds as retry plus `timeout`; the
+  UI shows a "fallback from ..." badge when it happens.
+- **Timeout**: each provider attempt is bounded by
+  `PROVIDER_REQUEST_TIMEOUT_SECONDS` (default 60s); a timeout is a normal
+  fallback-eligible error, not a hang.
+- **Cost**: computed from reported token usage using `Decimal` math
+  (never binary floats) against `models.yaml`'s per-million pricing.
+  Cached-token pricing is a stated, deliberate gap -- see
+  `docs/DESIGN.md`, "Cost Accounting".
+
+Full detail (including the exact streaming-retry-safety boundary and the
+security review) is in `docs/DESIGN.md`'s CP-06 section.
+
 ## Tenant identifier (take-home simplification)
 
 Requests are scoped by an `X-Tenant-Id` header (e.g. `tenant-a` or
@@ -217,6 +247,13 @@ and what production authentication would replace it with.
 - **Chunking is character-based, not token-based**, and context-window
   trimming's token counts are estimates (~4 chars/token) -- both stated
   as approximations, not exact.
+- **No per-tenant rate limiting or spend cap.** Per-request cost is
+  bounded (message length, output tokens, upload size), but nothing
+  stops a tenant from sending unlimited requests. Real rate limiting
+  needs shared state (Redis or equivalent), which is explicitly out of
+  scope for this take-home. See `docs/DESIGN.md`, "Security Review".
+- **Cached-token cost accounting is not implemented.** Reported but not
+  priced into `cost_usd` -- see `docs/DESIGN.md`, "Cost Accounting".
 
 ## Live vs. fixture-tested providers
 
@@ -237,11 +274,15 @@ scoped vector retrieval with configurable top-k and similarity threshold;
 server-side citation mapping (the model cannot fabricate trusted source
 metadata); a deterministic "I don't know" path when no evidence is
 found, without calling the model; a minimal RAG UI (collection
-management, upload, retrieval settings, inspectable citations).
+management, upload, retrieval settings, inspectable citations). CP-06
+adds: TTFT/latency/token/cost tracking per turn, a tenant-scoped
+`GET /api/usage/summary` endpoint, retry with backoff, config-driven
+fallback chains, per-attempt timeouts, and the explicit
+never-retry-after-visible-output safety boundary.
 
 **Not started (by design -- later checkpoints):** tool execution,
-retries/fallback, usage/cost dashboards, reranking, hybrid search,
-semantic caching, an evaluation framework.
+reranking, hybrid search, semantic caching, an evaluation framework,
+per-tenant rate limiting.
 
 ## Repository layout
 

@@ -30,6 +30,20 @@ class Settings(BaseSettings):
     # docs/DESIGN.md, "RAG Architecture".
     max_upload_bytes: int = 5_000_000
 
+    # Retry (CP-06) -- only rate_limit/server_error are ever retried (see
+    # app/services/retry.py), and only before any visible output has
+    # streamed. Conservative defaults: 2 retries, short bounded backoff.
+    retry_max_retries: int = 2
+    retry_base_delay_seconds: float = 0.5
+    retry_max_delay_seconds: float = 8.0
+
+    # A single request's provider call is wrapped in this overall timeout
+    # (per attempt) -- see ChatService._stream_one_attempt. Generous
+    # enough for a real streamed reply, bounded so a hung upstream
+    # connection can't hold a request open indefinitely.
+    provider_request_timeout_seconds: float = 60.0
+
+
 
 @lru_cache
 def get_settings() -> Settings:
