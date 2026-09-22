@@ -1,0 +1,56 @@
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api.health import router as health_router
+from app.core.config import get_settings
+from app.db.migrate import run_migrations
+from app.db.pool import create_pool
+from app.db.seed import ensure_dev_tenants
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    pool = await create_pool(settings.database_url)
+    app.state.pool = pool
+
+    await run_migrations(pool)
+    if settings.app_env == "development":
+        await ensure_dev_tenants(pool)
+
+    yield
+
+    await pool.close()
+
+
+app = FastAPI(title="Polyglot", lifespan=lifespan)
+
+settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    # A single configured origin, not "*" -- the frontend origin is the
+    # only caller this API is meant to serve from a browser.
+    allow_origins=[settings.frontend_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Ordinary exceptions must never leak stack traces, DB DSNs, or other
+    # internals to the client. The real exception still goes to the
+    # server log for us to debug.
+    logger.exception("Unhandled exception while handling %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+app.include_router(health_router, prefix="/api")

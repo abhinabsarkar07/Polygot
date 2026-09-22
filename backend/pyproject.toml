@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+# The `pool` fixture (and everything depending on it) is function-scoped,
+# so fixtures run on the same per-test event loop as the test itself.
+asyncio_default_fixture_loop_scope = "function"

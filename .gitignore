@@ -1,0 +1,28 @@
+# --- secrets ---
+.env
+*.env.local
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node / Vite ---
+node_modules/
+dist/
+.vite/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- local db files (if ever used) ---
+*.sqlite3
+*.db
