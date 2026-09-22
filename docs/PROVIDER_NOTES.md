@@ -8,13 +8,19 @@ against the installed SDK's own source (the most reliable source available
 docs, not blog posts or memory. Model IDs and pricing were additionally
 verified in CP-02; see the "Pricing" sections below for sources.
 
-**Live- vs fixture-tested:** all three adapters are **fixture-tested only**
-in CP-03 -- every test in `tests/providers/test_{anthropic,openai,gemini}_adapter.py`
-replaces the SDK client's methods with fakes built from shapes read
-directly out of the installed SDK source, and no test makes a real network
-call or requires an API key. No provider was exercised against a live API
-in this checkpoint. This is a deliberate, explicit choice (the assignment
-allows it), not an oversight -- see `docs/AI_USAGE.md` for why.
+**Live- vs fixture-tested:** all three adapters' own unit tests
+(`tests/providers/test_{anthropic,openai,gemini}_adapter.py`) remain
+**fixture-tested only** -- SDK client methods replaced with fakes, no
+network call, no API key required to run the suite. As of CP-04, however,
+**Anthropic has been live-tested end-to-end** through the real
+application (a real key, added and verified during CP-04's manual
+verification step): real non-streaming auth failure, a real streaming
+completion (`claude-sonnet` -> `claude-sonnet-5`, tokens genuinely
+streamed and rendered incrementally), and a real mid-generation
+cancellation, all against the live API -- see `docs/AI_USAGE.md`'s CP-04
+section for the three real bugs that live pass surfaced (none of them
+were in the adapter itself; see below). Gemini and OpenAI remain
+fixture-tested only -- no key was available to verify them live.
 
 ---
 
@@ -141,8 +147,16 @@ exception. See "Important Quirks".
 
 ## Cancellation
 
-Not live-tested (no real request was ever in flight to cancel). By
-construction: `stream()`'s `except Exception` clause does not catch
+Live-tested in CP-04: a real streaming generation was cancelled
+mid-response (via a client disconnect through the full app, not just at
+the adapter level), and the upstream Anthropic connection genuinely
+stopped -- confirmed by the accumulated text staying at a single
+character rather than continuing to grow after the disconnect. The
+adapter itself needed no changes for this; the bug CP-04 found and fixed
+was one level up, in how the *application* persisted the interrupted
+result under real cancellation semantics (Starlette's anyio cancel scope
+vs. plain `asyncio.Task.cancel()`) -- see `docs/DESIGN.md`, "Cancellation".
+By construction: `stream()`'s `except Exception` clause does not catch
 `asyncio.CancelledError` (a `BaseException` subclass since Python 3.8), so
 cancelling the consuming task propagates rather than being swallowed or
 converted into an `ErrorEvent`. Verified in

@@ -49,7 +49,7 @@ from app.providers.contracts import (
     Usage,
     UsageEvent,
 )
-from app.providers.errors import ProviderError, ProviderErrorKind
+from app.providers.errors import ProviderError, ProviderErrorKind, safe_message
 from app.providers.messages import (
     ContentBlock,
     ImageBlock,
@@ -268,4 +268,8 @@ class GeminiAdapter(Provider):
                 kind = ProviderErrorKind.SERVER_ERROR if isinstance(exc, genai_errors.ServerError) else ProviderErrorKind.BAD_REQUEST
         else:
             kind = ProviderErrorKind.UNKNOWN
-        return ProviderError(kind=kind, message=str(exc), provider=self.id)
+        # Same reasoning as AnthropicAdapter -- see its _translate_error and
+        # app/providers/errors.py::safe_message. str(exc) is logged, never
+        # forwarded to the browser.
+        logger.warning("gemini error (kind=%s): %s", kind.value, exc)
+        return ProviderError(kind=kind, message=safe_message(kind), provider=self.id)

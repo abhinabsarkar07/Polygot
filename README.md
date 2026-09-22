@@ -1,10 +1,15 @@
 # Polyglot -- Multi-Provider AI Workbench
 
-**Status: foundation only (CP-01).** There is no chat, no AI provider
-integration, and no RAG yet -- this README describes exactly what exists
-right now: a React/Vite frontend, a FastAPI backend, and a
-PostgreSQL-backed, tenant-isolated data layer, wired together and tested
-end to end.
+**Status: CP-04.** A working end-to-end chat workbench: create a
+conversation, pick a model (Anthropic, Gemini, or OpenAI -- whichever
+have API keys configured), send a message, watch the reply stream in
+token by token, stop generation mid-stream, switch providers between
+turns in the same conversation, and reload the page without losing
+anything. All of it is tenant-isolated at the database level.
+
+**Not yet built:** RAG, document upload, embeddings, tool execution,
+retries/fallback, usage dashboards. See `docs/DESIGN.md` for what's
+planned and not yet started.
 
 ## Prerequisites
 
@@ -14,9 +19,14 @@ end to end.
   interpreter, use the `py` launcher instead (`py -m venv`, etc.), as the
   commands below do.
 - **PostgreSQL** 16, running locally and reachable on `localhost:5432`.
-  No Docker/pgvector is required for this checkpoint -- see
-  `docs/DESIGN.md` for why (short version: pgvector is deferred to the
-  RAG checkpoint, in favor of a hand-rolled vector store).
+  No Docker/pgvector is required yet -- see `docs/DESIGN.md` for why
+  (short version: pgvector is deferred to the RAG checkpoint, in favor of
+  a hand-rolled vector store).
+- **At least one provider API key** (Anthropic, Gemini, or OpenAI) if you
+  want to actually send a message and see a real reply. Without one, the
+  app still runs fully -- conversations, the model list, and tenant
+  isolation all work -- but sending a message to an unconfigured
+  provider returns a clean `503`, not a crash.
 
 ## Database setup
 
@@ -61,8 +71,9 @@ created above, e.g.:
 DATABASE_URL=postgresql://polyglot_app:polyglot_dev_local_2026@localhost:5432/polyglot
 ```
 
-Leave `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` empty for
-now -- nothing in this checkpoint reads them.
+Set whichever of `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`
+you have -- each is independent; a provider with no key configured is
+simply unavailable (see "Configured models" below), not a startup error.
 
 ## Backend setup and run
 
@@ -84,14 +95,49 @@ npm install
 npm run dev
 ```
 
-Open the printed URL (default `http://localhost:5173`). The page shows
-"Backend: Connected" once it can reach the FastAPI health endpoint.
+Open the printed URL (default `http://localhost:5173`).
+
+## Using the chat UI
+
+1. The **Tenant** field at the top defaults to `tenant-a` (a dev tenant
+   seeded automatically -- `tenant-b` also exists, and has no access to
+   `tenant-a`'s conversations or vice versa; see "Tenant identifier"
+   below).
+2. Click **+ New Conversation**.
+3. Pick a model from the dropdown -- it's populated from whichever models
+   are configured in `backend/app/providers/models.yaml` (see "Configured
+   models"), regardless of whether that provider's API key is actually
+   set.
+4. Type a message and press Enter (or click Send). Tokens stream in as
+   they arrive from the real provider -- there is no artificial delay or
+   fake typewriter effect.
+5. Click **Stop** while generating to cancel -- this propagates all the
+   way to the upstream provider connection, not just to the browser's
+   rendering (see `docs/DESIGN.md`, "Cancellation").
+6. Switch the model dropdown before sending the next message to route
+   that turn to a different provider entirely, while keeping the full
+   prior conversation coherent (see `docs/DESIGN.md`, "Provider
+   Switching").
+7. Refreshing the page and reselecting the conversation shows the same
+   history, including whether any reply was cut short (marked "stopped").
+
+## Configured models
+
+| Internal id | Provider | Needs |
+| --- | --- | --- |
+| `claude-sonnet` | Anthropic | `ANTHROPIC_API_KEY` |
+| `gpt-5.6-terra` | OpenAI | `OPENAI_API_KEY` |
+| `gemini-2.5-flash` | Gemini | `GEMINI_API_KEY` |
+
+Real, sourced pricing and capabilities for each are in
+`backend/app/providers/models.yaml`; full API differences and sourcing in
+`docs/PROVIDER_NOTES.md`.
 
 ## Running tests
 
 Requires the database from the steps above to be running (tests exercise
-real row-level-security behavior, not mocks -- that boundary is the one
-thing in this checkpoint worth proving against the real thing).
+real row-level-security behavior, not mocks). No provider API key is
+required -- all provider/adapter tests use fixtures, never a live call.
 
 ```bash
 cd backend
@@ -106,30 +152,47 @@ intentionally simple and unsigned per the assignment's own guidance for a
 take-home -- see `docs/DESIGN.md` for what is and isn't protected by this,
 and what production authentication would replace it with.
 
+## Live vs. fixture-tested providers
+
+As of this checkpoint, **Anthropic has been manually verified against the
+real API** -- a real streamed reply, a real mid-generation Stop, and a
+real auth failure all confirmed working end-to-end through the actual
+running app. Gemini and OpenAI adapters are fixture-tested only (no key
+was available to verify them live); see `docs/PROVIDER_NOTES.md`'s
+"Live- vs fixture-tested" note for exactly what that means and what it
+doesn't.
+
 ## What is done, partial, and cut so far
 
-**Done:** frontend/backend scaffolding; centralized settings; CORS
-restricted to the configured frontend origin; a numbered-SQL migration
-runner; row-level-security-enforced tenant isolation with an automated
-test suite proving cross-tenant reads, lists, and inserts all fail, and
-that a connection with no tenant context set sees zero rows.
+**Done:** conversation + message persistence, tenant-isolated at the
+database level; real SSE token streaming from a live provider through to
+the browser; cancellation that reaches the upstream provider connection,
+not just the UI; provider/model switching mid-conversation with coherent
+history; deliberate (if approximate) context-window trimming; safe,
+provider-neutral error surfacing; a minimal but fully functional React
+chat UI.
 
-**Not started (by design -- later checkpoints):** any AI provider
-integration, chat, streaming, RAG, tool calling, usage/cost tracking,
-retries/fallback.
+**Not started (by design -- later checkpoints):** RAG, document upload,
+embeddings, vector search, citations, tool execution, retries/fallback,
+usage/cost dashboards.
 
 ## Repository layout
 
 ```
 polyglot/
-├── frontend/         React + TypeScript + Vite
+├── frontend/
+│   └── src/
+│       ├── api/           client, conversations, models, SSE parser
+│       └── components/    Chat, MessageList, ModelSelector, ConversationList
 ├── backend/
 │   ├── app/
-│   │   ├── api/          HTTP routes
-│   │   ├── core/         settings, tenant context
-│   │   ├── db/           pool, migrations, seed data
-│   │   ├── repositories/ tenant-scoped data access
-│   │   └── schemas/      request/response models
+│   │   ├── api/            HTTP routes (health, models, conversations)
+│   │   ├── core/            settings, tenant context
+│   │   ├── db/               pool, migrations, seed data
+│   │   ├── providers/     provider-neutral contracts, registries, adapters
+│   │   ├── repositories/  tenant-scoped data access
+│   │   ├── schemas/         request/response models
+│   │   └── services/         chat orchestration, context-window trimming
 │   └── tests/
 ├── docs/
 │   ├── DESIGN.md

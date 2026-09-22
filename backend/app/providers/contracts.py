@@ -47,9 +47,20 @@ class FinishReason(str, Enum):
 class CompletionRequest(BaseModel):
     """A provider-neutral request to complete a conversation.
 
-    ``model`` is our internal model id (see ``app/providers/models.py``),
-    never a provider's own model string -- resolving that is
-    ``ModelRegistry``'s job, not the caller's.
+    ``model`` is the exact model string a :class:`~app.providers.base.Provider`
+    sends upstream as-is -- by construction time, it must already be
+    ``ModelConfig.provider_model_id`` (see ``app/providers/models.py``),
+    not our internal model id. (An earlier version of this docstring said
+    the opposite; CP-04's live testing against a real provider caught the
+    mismatch -- a request built with the internal id got a real 404 from
+    Anthropic, since "claude-sonnet" isn't a model it knows about, only
+    "claude-sonnet-5" is.) Internal ids belong on application-facing
+    surfaces only -- the browser's model selector, ``ModelRegistry``'s own
+    keys, a persisted message's ``model_id`` column -- never on this
+    field. Resolving internal id -> ``provider_model_id`` is the one
+    caller (``ChatService.prepare_turn``, CP-04) that holds both a
+    ``ModelRegistry`` and constructs this request's job to do, once, in
+    one place.
 
     No cancellation field: Python's native mechanism for "stop this
     in-flight async operation" is cancelling the ``asyncio.Task`` running

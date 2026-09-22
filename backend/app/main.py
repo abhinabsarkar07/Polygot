@@ -6,11 +6,16 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.api.models import router as models_router
 from app.core.config import get_settings
 from app.db.migrate import run_migrations
 from app.db.pool import create_pool
 from app.db.seed import ensure_dev_tenants
+from app.providers.models import ModelRegistry
+from app.providers.wiring import build_provider_registry
+from app.services.chat import ChatService
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +29,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await run_migrations(pool)
     if settings.app_env == "development":
         await ensure_dev_tenants(pool)
+
+    model_registry = ModelRegistry.from_yaml()
+    provider_registry = build_provider_registry(settings)
+    app.state.model_registry = model_registry
+    app.state.provider_registry = provider_registry
+    app.state.chat_service = ChatService(model_registry, provider_registry)
 
     yield
 
@@ -54,3 +65,5 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 
 app.include_router(health_router, prefix="/api")
+app.include_router(models_router, prefix="/api")
+app.include_router(conversations_router, prefix="/api")

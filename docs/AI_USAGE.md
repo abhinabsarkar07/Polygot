@@ -285,3 +285,111 @@ credential-availability problem this time (CP-00 already flagged that
 possibility); it's simply what CP-03's own instructions call for ("Tests
 must NOT depend on paid/live APIs"). Recorded so this isn't mistaken for
 an oversight.
+
+## CP-04 -- Conversation persistence, real streaming, cancellation, minimal UI
+
+CP-04's manual end-to-end verification step (STEP 32) is what this
+section is mostly about -- three real, load-bearing bugs surfaced only by
+actually running the app against a live Anthropic key, none of which any
+fixture/unit test in this codebase (including ones written specifically
+to test the affected code) could have caught. All three are described in
+full, with the actual mechanism, in `docs/DESIGN.md`; this section is the
+narrative of finding them, not a duplicate of the technical explanation.
+
+**Incident 1 -- raw provider response body reaching the browser.** The
+first live request (an intentionally-wrong placeholder key a human
+pasted in, format `apikey_...`, not Anthropic's `sk-ant-...`) returned a
+401. The SSE `error` event's `message` field contained the *entire* raw
+Anthropic response body: `"Error code: 401 - {'type': 'error', 'error':
+{'type': 'authentication_error', 'message': 'invalid x-api-key'},
+'request_id': 'req_...'}"`. Root cause: every CP-03 adapter's
+`_translate_error` used `message=str(exc)`, and `str()` on this SDK's
+exceptions embeds the literal response body the SDK was constructed from
+-- confirmed by reading `anthropic/_base_client.py`, which builds the
+exception's message as `f"Error code: {status_code} - {body}"`. This is
+exactly the class of leak CP-04's own instructions (STEP 15) call out by
+name ("Do NOT send: ... raw response bodies containing sensitive
+information") -- it existed in CP-03 code for a full checkpoint before
+this one's live test surfaced it, because CP-03's fixture tests only ever
+constructed exceptions with short, hand-written messages like `"bad
+key"`, never a realistic SDK-formatted one.
+
+**Review:** fixed in all three adapters by introducing
+`app/providers/errors.py::safe_message(kind)` -- a fixed, generic,
+kind-keyed string -- and having each adapter log the real exception
+server-side (`logger.warning`) instead of forwarding it. A regression
+test (`test_error_message_never_leaks_the_raw_provider_response_body`)
+reconstructs the exact SDK-internal message-building pattern (not a
+hand-simplified one) to make sure this specific mistake can't quietly
+come back.
+
+**Incident 2 -- internal model id sent upstream instead of the
+provider's own.** Once the key was corrected (a real one, provided after
+being asked where to find it) and had credits, the very first real
+request returned a **different**, more fundamental error: `404 model:
+claude-sonnet`. `ChatService.prepare_turn` had been building
+`CompletionRequest(model=model_id, ...)` using the *internal* id
+throughout, while every CP-03 adapter was written assuming that field
+already held the resolved `provider_model_id` by the time it arrived --
+an assumption CP-02's own docstring for the field directly contradicted
+("never a provider's own model string"), and nothing had ever noticed
+the contradiction because no `CompletionRequest` had reached a real
+provider before this checkpoint's manual test.
+
+**Review:** this was a full application-breaking bug -- no request to
+any configured provider could ever have succeeded until it was fixed,
+and no unit test in the suite (all built on fake/scripted providers that
+don't validate the model string at all) was capable of catching it. Fixed
+in `ChatService.prepare_turn` (`CompletionRequest.model =
+model_config.provider_model_id`, not the internal id), and the
+contradictory CP-02 docstring was corrected to describe the shipped,
+working behavior rather than the original, untested intent. A regression
+test (`test_prepare_turn_resolves_provider_model_id_not_internal_id`)
+locks in the resolution even though, like all the fake-provider tests, it
+can't independently prove a real provider accepts the result -- that
+proof is what the live test itself provided.
+
+**Incident 3 -- cancellation silently persisted nothing.** With
+streaming genuinely working, Stop was tested next by force-closing a
+`curl` connection mid-generation. The existing unit test for this exact
+path (`test_stream_reply_persists_interrupted_message_on_cancellation`,
+which cancels a plain `asyncio.Task` against a hanging fake provider) had
+been green the entire time -- and yet the real conversation had zero
+assistant messages afterward, not even an interrupted one, both
+immediately and after waiting several seconds to rule out "still running
+in the background."
+
+**Review:** diagnosed with temporary logging rather than guessed at --
+the log showed the cleanup `INSERT`'s own `await` raising
+`CancelledError("Cancelled via cancel scope ... by <Task ...
+run_asgi()>")`, i.e. Starlette's `StreamingResponse` cancels via an
+*anyio cancel scope*, which (unlike a bare `asyncio.Task.cancel()`, what
+the passing unit test used) keeps re-raising `CancelledError` at *every*
+subsequent `await` in the same task until the scope itself exits --
+including the cleanup write, aborting it mid-`INSERT`. The unit test
+couldn't have caught this: it doesn't go through Starlette at all, so it
+never exercises anyio's cancel-scope semantics, only plain asyncio's
+"cancel once" behavior.
+
+**Final:** wrapped the cleanup persist in `asyncio.shield()`. Verified
+with the same temporary logging that `await shield(...)` still raises
+`CancelledError` back to the caller immediately (correct, expected
+`shield()` behavior, not a bug) while the shielded write itself keeps
+running detached and does complete -- confirmed by checking the
+conversation again ~2-5 seconds after disconnecting and seeing the
+interrupted row with the exact partial text that had streamed before the
+cut. Diagnostic logging was removed once the fix was confirmed; the
+finding is preserved in `docs/DESIGN.md`'s "Cancellation" section instead
+of left only in this log.
+
+**A note on how these were found, since it's the actual lesson:** all
+three were caught by literally running the app against a real provider
+and a real disconnect, not by writing more fixture tests, not by
+re-reading the code more carefully, and not by reasoning about asyncio
+semantics from first principles (the first cancellation fix attempt,
+`asyncio.shield()`, was applied on sound theoretical grounds *before*
+being verified, and initial verification looked like it hadn't worked
+until the actual timing was checked correctly -- confirming it live,
+rather than trusting the theory, is what caught that near-miss too).
+Every one of these bugs would have shipped invisibly in a submission that
+only ran the (extensive, and otherwise accurate) automated test suite.

@@ -12,7 +12,11 @@ from app.providers.wiring import build_provider_registry
 
 
 def _settings(**overrides) -> Settings:
-    return Settings(database_url="postgresql://unused/unused", **overrides)
+    # Explicit None defaults for all three keys -- this must not depend on
+    # backend/.env actually having no keys set (it does, in dev, once a
+    # real key is added for manual verification against a live provider).
+    defaults = {"anthropic_api_key": None, "gemini_api_key": None, "openai_api_key": None}
+    return Settings(database_url="postgresql://unused/unused", **{**defaults, **overrides})
 
 
 def test_no_keys_configured_builds_an_empty_registry_without_raising():

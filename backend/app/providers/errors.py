@@ -45,3 +45,30 @@ class ProviderError(Exception):
     def __repr__(self) -> str:
         provider = f", provider={self.provider!r}" if self.provider else ""
         return f"ProviderError(kind={self.kind!r}, message={self.message!r}{provider})"
+
+
+# CP-04 found (via a real, live 401 against Anthropic -- not a fixture test)
+# that `str(some_sdk_exception)` routinely embeds the provider's raw response
+# body: `str(anthropic.AuthenticationError(...))` includes the full
+# `{'type': 'error', 'error': {...}, 'request_id': '...'}` payload the SDK
+# was constructed from. `ProviderError.message` is what an adapter's
+# `stream()` puts directly into a browser-facing `ErrorEvent` (see
+# app/api/conversations.py), so it must never be that raw string -- a fixed,
+# generic message per `kind` is both safe and, for a *normalized* error,
+# genuinely all there is to say. Adapters log the real exception server-side
+# (never discarded, just not forwarded) at the point they call this.
+_SAFE_MESSAGES: dict[ProviderErrorKind, str] = {
+    ProviderErrorKind.AUTH: "Authentication with the provider failed.",
+    ProviderErrorKind.RATE_LIMIT: "The provider is temporarily rate-limiting requests.",
+    ProviderErrorKind.CONTEXT_LENGTH: "The request exceeded the model's context window.",
+    ProviderErrorKind.CONTENT_FILTER: "The request was blocked by the provider's content policy.",
+    ProviderErrorKind.TIMEOUT: "The request to the provider timed out.",
+    ProviderErrorKind.SERVER_ERROR: "The provider is experiencing an internal error. Please try again.",
+    ProviderErrorKind.BAD_REQUEST: "The request was rejected as invalid.",
+    ProviderErrorKind.UNSUPPORTED: "This operation is not supported by the selected provider.",
+    ProviderErrorKind.UNKNOWN: "An unexpected error occurred.",
+}
+
+
+def safe_message(kind: ProviderErrorKind) -> str:
+    return _SAFE_MESSAGES[kind]

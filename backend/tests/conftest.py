@@ -18,10 +18,10 @@ async def pool():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _clean_notes_between_tests(pool):
+async def _clean_tables_between_tests(pool):
     yield
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE notes")
+        await conn.execute("TRUNCATE notes, messages, conversations")
 
 
 async def _tenant_by_slug(pool: asyncpg.Pool, slug: str) -> TenantContext:

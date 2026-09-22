@@ -358,3 +358,200 @@ for "unknown provider id". Not wired into `app/main.py` yet -- there's no
 chat service to hand the registry to until CP-04 -- so this is proven
 directly against the function (`tests/providers/test_wiring.py`) rather
 than only observable by booting the app.
+
+## CP-04 Conversation Flow
+
+```
+React (Chat.tsx)
+  -> POST /api/conversations/{id}/messages/stream    (fetch, not EventSource -- see "Streaming")
+  -> FastAPI route (app/api/conversations.py::stream_message)
+  -> get_tenant_context()                             (CP-01's one trusted tenant boundary)
+  -> ChatService.prepare_turn()                        (app/services/chat.py)
+       -> ConversationRepository.get()                 tenant-scoped; unowned id -> 404
+       -> MessageRepository.create() (the user message, committed immediately)
+       -> MessageRepository.list_for_conversation()    -> normalized Message history
+       -> trim_to_context_window()                     (app/services/context_window.py)
+       -> ModelRegistry.get() -> ProviderRegistry.get() (generic, CP-02/03 resolution)
+  -> ChatService.stream_reply()
+       -> provider.stream(CompletionRequest)            real provider streaming, CP-03 adapter
+       -> StreamEvent per token/tool/usage/done/error
+  -> SSE-formatted over the HTTP response                (app/api/conversations.py::_format_sse)
+  -> React's own SSE parser (src/api/sse.ts)
+  -> incremental render (Chat.tsx)
+  -> on stream end: assistant message persisted           (ChatService.stream_reply, see "Cancellation")
+```
+
+### Why two short transactions, not one long one
+
+`prepare_turn` and `stream_reply` each open (and close) their own
+`tenant_connection` -- there is no database connection held open for the
+duration of token generation, which can run for seconds to minutes. Two
+consequences, both deliberate:
+
+1. **No connection-pool exhaustion under concurrent generations.** A
+   pool sized for request/response traffic isn't sized for "one
+   connection checked out per in-flight LLM generation."
+2. **The user's own message survives cancellation no matter when it
+   happens.** A single transaction spanning prepare + stream + persist
+   would roll back the already-inserted user message the moment a
+   cancellation unwound through it. Splitting the turn into two
+   independent, already-committed writes means there is nothing left for
+   a mid-stream cancellation to undo.
+
+## Streaming
+
+`EventSource` was not used -- it only issues GET requests, and sending a
+user's message is naturally a POST body (content + model id), not query
+parameters. The streaming endpoint is consumed with `fetch` and a raw
+`ReadableStream` reader instead (`src/api/sse.ts`), which is also what
+makes real cancellation possible: an `EventSource`'s built-in reconnect
+behavior actively fights a deliberate "stop this specific request"
+gesture; a plain `fetch` tied to an `AbortController` does exactly what's
+asked and nothing more.
+
+This is **real** provider-to-browser streaming, not a simulated typewriter
+effect: `ChatService.stream_reply` does `async for event in
+provider.stream(request): yield event` and the API route forwards each
+event as its own SSE frame the moment it arrives -- there is no
+"accumulate the full response, then chop it into fake chunks" step
+anywhere in this path. The adapter's `text_delta` events are exactly the
+provider's own token/text deltas (see docs/PROVIDER_NOTES.md for each
+provider's actual streaming granularity), forwarded essentially
+unbuffered.
+
+**Why `EventSource` couldn't be used even if the request were a GET:**
+irrelevant here since the request is a POST, but worth being precise
+about -- the deeper reason a hand-rolled parser exists at all
+(`src/api/sse.ts`) is that a `fetch` body reader hands you raw network
+chunks with no guarantee they align with SSE record boundaries. See
+`src/api/sse.ts`'s own module docstring for exactly how that's handled
+(buffering across reads, `TextDecoder({ stream: true })` for split
+multi-byte UTF-8, never assuming one chunk is one event or one event is
+one chunk).
+
+## Cancellation
+
+```
+Browser: Stop button -> AbortController.abort()
+  -> the in-flight fetch's underlying connection closes
+  -> ASGI server observes the disconnect
+  -> Starlette's StreamingResponse cancels the task iterating
+     the response body (app/api/conversations.py::event_source)
+  -> asyncio.CancelledError raised inside ChatService.stream_reply,
+     at whatever await the provider adapter was suspended on
+  -> the adapter's own `await http-call` unwinds the same way,
+     closing the actual upstream connection to the provider
+```
+
+`ChatService.stream_reply` catches `asyncio.CancelledError` specifically
+(never a bare `except:` or `except Exception`, which would swallow it --
+`CancelledError` has been a `BaseException` subclass since Python 3.8
+specifically so broad handlers don't accidentally eat it), persists
+whatever text had been accumulated so far as `status="interrupted"`
+(see "Cancelled message persistence" below), and then **re-raises** --
+the cancellation must keep propagating for the provider's own connection
+to actually close, not just for this function to stop yielding.
+
+### A real subtlety found only by live-testing Stop, not by unit tests
+
+The first implementation persisted *nothing* on real cancellation --
+not even an interrupted row -- despite an existing unit test
+(`test_stream_reply_persists_interrupted_message_on_cancellation`,
+using a plain `asyncio.Task.cancel()` against a hanging fake provider)
+passing the whole time. The unit test's cancellation and a real Stop
+click go through genuinely different mechanisms: Starlette's
+`StreamingResponse` cancels via an **anyio cancel scope**
+(`starlette/responses.py`, `task_group.cancel_scope.cancel()`), and once
+that scope is cancelled, *every subsequent `await` in the same task*
+keeps re-raising `CancelledError` at its next checkpoint -- including a
+plain `await` on the cleanup insert itself, which was silently aborting
+mid-`INSERT` every time. A bare `Task.cancel()` (what the unit test used)
+delivers cancellation once; an anyio cancel scope keeps delivering it
+until the scope exits. The fix is `asyncio.shield()` around the cleanup
+write: `await asyncio.shield(coro)` still raises `CancelledError` back to
+the caller immediately (expected, not a bug), but the shielded `coro`
+runs as a genuinely separate `Task` the cancel scope doesn't reach, so it
+completes a moment later regardless. Confirmed live: without `shield()`,
+Stop-ing a long generation left the assistant's partial reply nowhere;
+with it, the interrupted row reliably appears ~1-2 seconds after
+disconnect.
+
+## Cancelled message persistence
+
+**Decision: persist the partial output, with `status = "interrupted"`,
+never silently as `"complete"`.** The alternative (drop it, keep only the
+user's message) is simpler but throws away real generation the user
+already paid for and might still want. `messages.status` (see
+`004_messages.sql`) makes the distinction explicit in storage, not just
+in a transient UI flag -- refreshing the page still shows a response was
+cut short, not a normal one. The user's own message is never affected
+either way; it was already committed before generation started (see
+"Why two short transactions" above).
+
+## Context Window Management
+
+`app/services/context_window.py::trim_to_context_window`: keep the newest
+messages, drop the oldest, until the estimated token count fits
+`model_config.context_window` minus a reserved output budget
+(`DEFAULT_MAX_OUTPUT_TOKENS = 4096`) times a 0.9 safety margin. No
+summarization subsystem -- a deterministic drop-the-oldest strategy is
+what a one-day take-home can build *and verify*; summarization would add
+an entire extra LLM call (with its own cost, latency, and failure modes)
+to every turn for a scenario (context overflow) that won't even trigger
+in most demo conversations against the ~1M-token windows this project's
+configured models actually have.
+
+**The token estimate is honestly approximate, not exact.** None of the
+three providers' official Python SDKs expose one free, universal
+tokenizer usable identically across all three without adding a
+per-provider dependency just for counting. The well-known ~4-characters-
+per-token heuristic is used instead, documented as an estimate in the
+module itself, not presented as precise. The one behavior guarantee that
+*is* exact: the newest message is always included even if its own
+estimate alone exceeds the budget -- CP-04 decides which whole messages
+to include, it does not truncate content within a message, so an
+over-budget single message is sent as-is and left to the provider's own
+real `context_length` error if it truly doesn't fit, rather than silently
+returning an empty conversation.
+
+## Provider Switching
+
+`ChatService.prepare_turn` reconstructs conversation history from
+`MessageRepository` on every turn as normalized `Message` objects (see
+`app/repositories/messages.py` -- `content` is stored as the same
+`ContentBlock` JSON the CP-02 contract defines, not a provider-shaped
+transcript), independent of which provider generated which prior
+message. Nothing about a conversation is "sticky" to a provider: turn 1
+can resolve to `AnthropicAdapter`, turn 2 to `GeminiAdapter`, and turn 2's
+`CompletionRequest.messages` still contains turn 1's user message *and*
+Claude's own reply, exactly as stored. `messages.model_id` records which
+internal model id produced each assistant message (for observability --
+visible in the UI's message metadata) but is never read back to
+constrain or influence which provider a *later* turn uses; that choice
+comes only from the model the browser sends with that turn's own
+request. Proven directly in
+`tests/services/test_chat_service.py::test_provider_switches_between_turns_while_history_stays_coherent`,
+which asserts the second (different) provider's received request
+literally contains the first provider's generated text.
+
+### A contract inconsistency `CompletionRequest.model` had, found live
+
+CP-02's original docstring for `CompletionRequest.model` said it holds
+the *internal* model id, "never a provider's own model string." CP-03's
+adapters were actually built assuming the opposite -- that by the time a
+request reaches `Provider.stream()`, `.model` already **is** the exact
+string to send upstream (e.g. `"claude-sonnet-5"`), because that's the
+only way an adapter can avoid depending on `ModelRegistry` itself. Both
+assumptions shipped without anything reconciling them, because no code
+before CP-04 ever actually sent a `CompletionRequest` to a real provider.
+The gap surfaced immediately on the first live request: Anthropic
+returned a real 404, `"model: claude-sonnet"` -- an internal id it
+naturally has no record of. Fixed in `ChatService.prepare_turn`, the one
+place that holds both a resolved `ModelConfig` and constructs the
+request: `CompletionRequest.model` is now always built from
+`model_config.provider_model_id`, and the contradictory docstring in
+`app/providers/contracts.py` was corrected to describe the shipped
+behavior instead of the abandoned original intent. Internal ids stay
+exactly where they belong -- `SendMessageRequest.model` (the browser-
+facing field), `ModelRegistry`'s own keys, and `messages.model_id` in
+storage -- never inside a `CompletionRequest` an adapter actually reads.

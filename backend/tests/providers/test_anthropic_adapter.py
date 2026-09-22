@@ -326,3 +326,30 @@ async def test_complete_translates_native_errors_to_normalized_kinds(adapter, ex
 
     assert exc_info.value.kind == expected_kind
     assert exc_info.value.provider == "anthropic"
+
+
+async def test_error_message_never_leaks_the_raw_provider_response_body(adapter):
+    # Found via live testing (not a fixture), not assumed: anthropic SDK
+    # exceptions' str() embeds the full raw response body, e.g.
+    # `{'type': 'error', 'error': {'type': 'authentication_error', ...},
+    # 'request_id': 'req_...'}`. That must never reach ProviderError.message
+    # (see app/providers/errors.py::safe_message) -- it's what an adapter's
+    # stream() forwards straight into a browser-facing SSE ErrorEvent.
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}, "request_id": "req_011CfJHyxybRvKkehA3iQ2q3"}
+    response = httpx.Response(401, request=request, json=body)
+    # Reproduces exactly how the SDK itself builds this exception internally
+    # (anthropic/_base_client.py: `err_msg = f"Error code: {response.status_code} - {body}"`)
+    # -- not a clean hand-written message, the literal raw body dict.
+    exc = anthropic.AuthenticationError(f"Error code: {response.status_code} - {body}", response=response, body=body)
+    assert "request_id" in str(exc)  # confirms the raw exception really does embed the body
+
+    adapter._client.messages.create = AsyncMock(side_effect=exc)
+    with pytest.raises(Exception) as exc_info:
+        await adapter.complete(
+            CompletionRequest(model="claude-sonnet-5", messages=[Message(role=Role.USER, content=[TextBlock(text="hi")])], max_tokens=100)
+        )
+
+    assert "request_id" not in exc_info.value.message
+    assert "authentication_error" not in exc_info.value.message
+    assert exc_info.value.message == "Authentication with the provider failed."

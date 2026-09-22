@@ -35,7 +35,7 @@ from app.providers.contracts import (
     Usage,
     UsageEvent,
 )
-from app.providers.errors import ProviderError, ProviderErrorKind
+from app.providers.errors import ProviderError, ProviderErrorKind, safe_message
 from app.providers.messages import (
     ContentBlock,
     ImageBlock,
@@ -264,4 +264,10 @@ class AnthropicAdapter(Provider):
             kind = ProviderErrorKind.SERVER_ERROR
         else:
             kind = ProviderErrorKind.UNKNOWN
-        return ProviderError(kind=kind, message=str(exc), provider=self.id)
+        # The raw exception (which for anthropic's SDK includes the full
+        # response body, not just a short message -- confirmed via a real
+        # 401 during CP-04 manual verification) is logged here, server-side
+        # only. ProviderError.message is a fixed, safe-for-the-browser
+        # string per kind -- see app/providers/errors.py::safe_message.
+        logger.warning("anthropic error (kind=%s): %s", kind.value, exc)
+        return ProviderError(kind=kind, message=safe_message(kind), provider=self.id)
