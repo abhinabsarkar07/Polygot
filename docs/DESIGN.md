@@ -2,8 +2,8 @@
 
 This document explains what Polyglot is and why it's built the way it is.
 It is organized by topic, not by build checkpoint -- the project itself
-was built incrementally (CP-01 through CP-06, `docs/AI_USAGE.md` has that
-history), but a reviewer reading this file cares about the current
+was built incrementally, one checkpoint's commit at a time (see `git log`),
+but a reviewer reading this file cares about the current
 architecture, not the order it was assembled in.
 
 ## Architecture Overview

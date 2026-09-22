@@ -17,15 +17,15 @@ application (a real key, added and verified during CP-04's manual
 verification step): real non-streaming auth failure, a real streaming
 completion (`claude-sonnet` -> `claude-sonnet-5`, tokens genuinely
 streamed and rendered incrementally), and a real mid-generation
-cancellation, all against the live API -- see `docs/AI_USAGE.md`'s CP-04
-section for the three real bugs that live pass surfaced (none of them
-were in the adapter itself; see below). **Gemini and OpenAI *chat*
-adapters remain fixture-tested only** -- never exercised against a live
-key. A real `OPENAI_API_KEY` was added to the environment during CP-05,
-but the only live exercise it actually received was the *negative* path
--- confirming a clean `status: "failed", error: "no embedding provider is
-configured"` with the key unset (see `docs/AI_USAGE.md`'s CP-05 section,
-"Manual verification finding, live"). A real successful embeddings call
+cancellation, all against the live API -- see `docs/DESIGN.md`'s
+"Cancellation" for the mechanism behind the most significant bug that
+live pass surfaced (not in the adapter itself; see below). **Gemini and
+OpenAI *chat* adapters remain fixture-tested only** -- never exercised
+against a live key. A real `OPENAI_API_KEY` was added to the environment
+during RAG development, but the only live exercise it actually received
+was the *negative* path -- confirming a clean `status: "failed", error:
+"no embedding provider is configured"` with the key unset. A real
+successful embeddings call
 (and therefore real end-to-end RAG retrieval/citations against live
 embeddings) was never performed -- stated here plainly rather than
 implied by the key having existed at some point.
