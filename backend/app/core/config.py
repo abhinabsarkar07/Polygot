@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     openai_api_key: str | None = None
 
+    # RAG document upload (CP-05). Synchronous, in-request ingestion is
+    # only defensible with a hard, deliberately small cap -- see
+    # docs/DESIGN.md, "RAG Architecture".
+    max_upload_bytes: int = 5_000_000
+
 
 @lru_cache
 def get_settings() -> Settings:

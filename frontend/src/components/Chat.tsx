@@ -7,6 +7,7 @@ import { MessageList, type DisplayMessage } from "./MessageList";
 interface Props {
   tenantId: string;
   conversationId: string;
+  collectionId: string | null;
 }
 
 function toDisplayMessages(detail: Awaited<ReturnType<typeof getConversation>>): DisplayMessage[] {
@@ -19,12 +20,17 @@ function toDisplayMessages(detail: Awaited<ReturnType<typeof getConversation>>):
   }));
 }
 
-export function Chat({ tenantId, conversationId }: Props) {
+export function Chat({ tenantId, conversationId, collectionId }: Props) {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState("");
   const [model, setModel] = useState("");
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Query-time RAG controls (STEP 25) -- distinct from chunk size/overlap,
+  // which are ingestion-time (see CollectionPanel.tsx). Only meaningful,
+  // and only shown, when a collection is actually selected.
+  const [topK, setTopK] = useState(5);
+  const [similarityThreshold, setSimilarityThreshold] = useState(0.3);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -62,10 +68,14 @@ export function Chat({ tenantId, conversationId }: Props) {
       setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)));
     }
 
+    const rag = collectionId ? { collectionId, topK, similarityThreshold } : undefined;
+
     try {
-      for await (const event of streamMessage(tenantId, conversationId, content, model, controller.signal)) {
+      for await (const event of streamMessage(tenantId, conversationId, content, model, controller.signal, rag)) {
         if (event.type === "text_delta") {
           setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + event.text } : m)));
+        } else if (event.type === "sources") {
+          updateAssistant({ sources: event.sources });
         } else if (event.type === "done") {
           updateAssistant({ status: "complete" });
         } else if (event.type === "error") {
@@ -94,6 +104,26 @@ export function Chat({ tenantId, conversationId }: Props) {
     <section className="chat">
       <MessageList messages={messages} />
       {error && <div className="error-banner">{error}</div>}
+      {collectionId && (
+        <div className="rag-controls">
+          <label>
+            Top-K{" "}
+            <input type="number" min={1} max={20} value={topK} onChange={(e) => setTopK(Number(e.target.value))} disabled={generating} />
+          </label>
+          <label>
+            Similarity threshold{" "}
+            <input
+              type="number"
+              min={-1}
+              max={1}
+              step={0.05}
+              value={similarityThreshold}
+              onChange={(e) => setSimilarityThreshold(Number(e.target.value))}
+              disabled={generating}
+            />
+          </label>
+        </div>
+      )}
       <div className="composer">
         <ModelSelector tenantId={tenantId} value={model} onChange={setModel} disabled={generating} />
         <textarea

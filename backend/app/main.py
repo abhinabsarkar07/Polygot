@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.collections import router as collections_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.api.models import router as models_router
@@ -16,6 +17,15 @@ from app.db.seed import ensure_dev_tenants
 from app.providers.models import ModelRegistry
 from app.providers.wiring import build_provider_registry
 from app.services.chat import ChatService
+from app.services.embeddings import EmbeddingService
+from app.services.ingestion import IngestionService
+from app.services.retrieval import RetrievalService
+
+# Internal model id of the one embedding model CP-05 configures -- see
+# app/providers/models.yaml. A constant here, not scattered across the
+# services that need it (mirrors how ChatService takes a resolved
+# ModelRegistry rather than any service hardcoding a chat model id).
+EMBEDDING_MODEL_ID = "text-embedding-3-small"
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +44,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     provider_registry = build_provider_registry(settings)
     app.state.model_registry = model_registry
     app.state.provider_registry = provider_registry
-    app.state.chat_service = ChatService(model_registry, provider_registry)
+
+    # Constructed unconditionally, same as every provider adapter --
+    # EmbeddingService resolves its provider lazily (see its own
+    # docstring), so this never crashes startup just because
+    # OPENAI_API_KEY happens to be unset. RAG features are simply
+    # unavailable (a clear 503, see RagUnavailableError) until it is.
+    embedding_service = EmbeddingService(provider_registry, model_registry.get(EMBEDDING_MODEL_ID))
+    retrieval_service = RetrievalService(embedding_service)
+    app.state.ingestion_service = IngestionService(embedding_service)
+    app.state.chat_service = ChatService(model_registry, provider_registry, retrieval=retrieval_service)
 
     yield
 
@@ -67,3 +86,4 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 app.include_router(health_router, prefix="/api")
 app.include_router(models_router, prefix="/api")
 app.include_router(conversations_router, prefix="/api")
+app.include_router(collections_router, prefix="/api")

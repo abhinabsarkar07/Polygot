@@ -10,9 +10,10 @@ any of these models), not honored.
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.providers.messages import ContentBlock
+from app.services.retrieval import DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_K, MAX_TOP_K, MIN_TOP_K
 
 
 class CreateConversationRequest(BaseModel):
@@ -45,3 +46,13 @@ class SendMessageRequest(BaseModel):
     # server-side via ModelRegistry -- never a provider-native model
     # string. See app/services/chat.py::ChatService.prepare_turn.
     model: str
+
+    # RAG (CP-05), all optional -- omitting collection_id is ordinary
+    # CP-04 chat, unaffected. top_k/similarity_threshold are QUERY-time
+    # controls (STEP 25) -- chunk size/overlap are INGESTION-time
+    # settings instead (see UploadDocumentQuery below); re-querying the
+    # same collection with different top_k/threshold never requires
+    # re-indexing anything.
+    collection_id: UUID | None = None
+    top_k: int = Field(default=DEFAULT_TOP_K, ge=MIN_TOP_K, le=MAX_TOP_K)
+    similarity_threshold: float = Field(default=DEFAULT_SIMILARITY_THRESHOLD, ge=-1.0, le=1.0)

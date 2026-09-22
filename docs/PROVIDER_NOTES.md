@@ -573,3 +573,76 @@ guessed number.
 - https://ai.google.dev/gemini-api/docs/migrate
 - https://ai.google.dev/gemini-api/docs/pricing
 - Installed SDK source: `google/genai/types.py`, `google/genai/errors.py`, `google/genai/models.py` (`google-genai==2.24.0`)
+
+---
+
+# Embeddings (CP-05)
+
+## Provider and Model
+
+**OpenAI, `text-embedding-3-small`** -- confirmed 1536-dimension output
+(default; the model supports a `dimensions` parameter to shorten it, not
+used here), 8192 max input tokens, via
+`developers.openai.com/api/docs/guides/embeddings` (fetched directly) and
+the installed SDK's own `openai/types/embedding.py`.
+
+**Why OpenAI over Anthropic or Gemini:** Anthropic has no first-party
+embeddings endpoint at all (confirmed in CP-03's own research -- still
+true as of this check). Between OpenAI and Gemini, OpenAI was chosen
+specifically because its SDK (`openai==3.17.0`) was already installed and
+already in use for chat (`app/providers/openai_adapter.py`) -- adding
+embeddings support meant one new method (`OpenAIAdapter.embed()`), zero
+new dependencies. This is a config/implementation-simplicity choice, not
+a quality claim about OpenAI's embeddings over Gemini's.
+
+## Architecture: reused, not duplicated
+
+CP-02 already defined `Provider.embed()` as part of the core interface,
+specifically anticipating an embedding-capable adapter overriding a
+default that otherwise raises `ProviderError(kind=UNSUPPORTED)`. CP-05
+does exactly that (`OpenAIAdapter.embed()`, calling
+`client.embeddings.create(...)`) rather than building a second, parallel
+`EmbeddingProvider` registry -- RAG code depends on
+`app/services/embeddings.py::EmbeddingService`, a thin wrapper offering
+`embed_documents`/`embed_query`, which itself calls `Provider.embed()`
+through the *same* `ProviderRegistry` chat already uses. See
+`docs/DESIGN.md`'s CP-02 section for the tradeoff this avoided (a second
+resolution/credential-availability mechanism duplicating what already
+exists).
+
+## Configuration
+
+Modeled as one more `models.yaml` entry (`ModelConfig`), not a separate
+config system -- `capabilities.embeddings = true` already existed as a
+field since CP-02. Two additions needed for CP-05 specifically: a
+`dimension: int | None` field (required in practice for any
+embeddings-capable entry, enforced by `007_chunks.sql`'s own CHECK
+constraint independently of what config says), and
+`PricingConfig.output_per_million` widened from required to
+`float | None` -- an embedding call has no output-token pricing
+dimension at all, which is a different fact from "output happens to be
+free," the same "not reported" vs. "reported as zero" distinction used
+throughout this config since CP-02.
+
+## Pricing
+
+Verified 2026-09-22 against `developers.openai.com/api/docs/guides/embeddings`
+and cross-checked via search aggregation.
+
+| | Input | Output |
+| --- | --- | --- |
+| text-embedding-3-small | $0.02 / MTok | n/a (no output-token dimension) |
+
+## Cancellation / Streaming
+
+Not applicable -- `Provider.embed()` is not a streaming operation in the
+CP-02 interface (a single request, a single response array of vectors),
+so none of CP-04's cancellation machinery is relevant here. An ingestion
+request that's cancelled mid-upload simply aborts the whole synchronous
+request; there is no partial-embedding state to reconcile.
+
+## Live- vs Fixture-Tested
+
+Not live-tested during initial CP-05 development -- see `docs/AI_USAGE.md`
+for whether this was verified against the real API afterward and what
+that verification found.

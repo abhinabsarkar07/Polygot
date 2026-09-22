@@ -44,6 +44,20 @@ export interface ConversationDetail extends ConversationSummary {
   messages: MessageResponse[];
 }
 
+// `sources` is an application-level RAG event (app/services/rag.py's
+// SourcesEvent), not a CP-02 provider StreamEvent -- but the wire shape
+// (a `type` discriminator + JSON body) is identical, so it's just another
+// member of the same union from the frontend's point of view.
+export interface CitedSource {
+  id: string; // "S1", "S2", ...
+  document_id: string;
+  filename: string;
+  chunk_index: number;
+  page_number: number | null;
+  text: string;
+  similarity: number;
+}
+
 export type StreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_use_start"; id: string; name: string }
@@ -51,4 +65,27 @@ export type StreamEvent =
   | { type: "tool_use_complete"; id: string; name: string; input: Record<string, unknown> }
   | { type: "usage"; usage: Record<string, number | null> }
   | { type: "done"; finish_reason: string }
-  | { type: "error"; kind: string; message: string };
+  | { type: "error"; kind: string; message: string }
+  | { type: "sources"; sources: CitedSource[] };
+
+// --- RAG: collections and documents (CP-05) -------------------------------------
+
+export interface CollectionSummary {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+export interface DocumentInfo {
+  id: string;
+  collection_id: string;
+  filename: string;
+  content_type: string;
+  status: "processing" | "ready" | "failed";
+  error: string | null;
+  created_at: string;
+}
+
+export interface CollectionDetail extends CollectionSummary {
+  documents: DocumentInfo[];
+}

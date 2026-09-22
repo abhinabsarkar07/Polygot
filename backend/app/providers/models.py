@@ -35,7 +35,12 @@ class PricingConfig(BaseModel):
     zero" distinction as ``Usage``."""
 
     input_per_million: float
-    output_per_million: float
+    # None for an embeddings-only model (CP-05): there is no separate
+    # "output" pricing dimension for an embedding call at all, which is a
+    # different fact than "output happens to be free" -- same "not
+    # reported" vs "reported as zero" distinction used throughout this
+    # config, not a special case invented for embeddings.
+    output_per_million: float | None = None
     cached_input_per_million: float | None = None
 
 
@@ -45,13 +50,24 @@ class ModelConfig(BaseModel):
     resolved from config -- never hardcoded in a service or route. Keeping
     these separate is what stops a provider's naming scheme from leaking
     into the rest of the application; renaming or repointing a model in
-    ``models.yaml`` never touches application code."""
+    ``models.yaml`` never touches application code.
+
+    ``context_window`` doubles as "max input tokens per call" for an
+    embeddings-only model (CP-05) -- a real, if imperfect, reuse of an
+    existing field rather than adding a second one that would mean nearly
+    the same thing for every chat model. ``dimension`` is the one field
+    genuinely specific to embedding models -- ``None`` for every chat
+    model, required in practice (validated by the CP-05 migration's own
+    CHECK constraint, not just here) for any model with
+    ``capabilities.embeddings = true``.
+    """
 
     id: str
     provider: str
     provider_model_id: str
     context_window: int
     max_output_tokens: int | None = None
+    dimension: int | None = None
     capabilities: ModelCapabilities
     pricing: PricingConfig
 

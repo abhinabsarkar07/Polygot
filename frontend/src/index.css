@@ -33,12 +33,17 @@ header p {
   min-height: 0;
 }
 
-.conversation-list {
-  width: 220px;
+.sidebar {
+  width: 260px;
   flex-shrink: 0;
   border-right: 1px solid #8884;
-  padding: 12px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.conversation-list {
+  padding: 12px;
 }
 
 .conversation-list ul {
@@ -127,4 +132,126 @@ header p {
   flex: 1;
   min-height: 2.5em;
   font: inherit;
+}
+
+.collection-panel {
+  padding: 12px;
+  border-top: 1px solid #8884;
+}
+
+.collection-panel h3 {
+  margin: 0 0 8px;
+  font-size: 0.9em;
+  opacity: 0.75;
+}
+
+.collection-panel select {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.collection-create-row {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.collection-create-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.chunking-controls {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 0.85em;
+}
+
+.chunking-controls input {
+  width: 70px;
+}
+
+.collection-upload input[type="file"] {
+  display: block;
+  margin: 6px 0;
+  font-size: 0.85em;
+}
+
+.document-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  font-size: 0.85em;
+}
+
+.document-list li {
+  margin-bottom: 4px;
+}
+
+.document-list-empty {
+  opacity: 0.6;
+}
+
+.doc-status {
+  font-weight: bold;
+}
+
+.doc-status-ready {
+  color: #2e7d32;
+}
+
+.doc-status-processing {
+  color: #b8860b;
+}
+
+.doc-status-failed {
+  color: #c0392b;
+}
+
+.doc-error {
+  opacity: 0.7;
+}
+
+.rag-controls {
+  display: flex;
+  gap: 16px;
+  font-size: 0.85em;
+  margin-bottom: 8px;
+  opacity: 0.85;
+}
+
+.rag-controls input {
+  width: 70px;
+}
+
+.source-list {
+  margin-top: 8px;
+  font-size: 0.85em;
+}
+
+.source-list-label {
+  opacity: 0.6;
+  margin-bottom: 4px;
+}
+
+.source-item {
+  margin-bottom: 4px;
+}
+
+.source-chip {
+  background: #8882;
+  border: 1px solid #8884;
+  border-radius: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+  font-size: 0.95em;
+}
+
+.source-detail {
+  margin: 4px 0 0 4px;
+  padding: 6px 10px;
+  border-left: 2px solid #8886;
+  white-space: pre-wrap;
+  opacity: 0.85;
 }

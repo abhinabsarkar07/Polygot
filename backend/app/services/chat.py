@@ -32,14 +32,17 @@ import asyncpg
 from app.core.tenant import TenantContext
 from app.db.pool import tenant_connection
 from app.providers.base import Provider
-from app.providers.contracts import CompletionRequest, DoneEvent, ErrorEvent, StreamEvent, TextDeltaEvent
+from app.providers.contracts import CompletionRequest, DoneEvent, ErrorEvent, FinishReason, StreamEvent, TextDeltaEvent
 from app.providers.errors import ProviderErrorKind
 from app.providers.messages import Message, Role, TextBlock
 from app.providers.models import ModelRegistry
 from app.providers.registry import ProviderRegistry
+from app.repositories.chunks import ChunkRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.messages import MessageRepository
-from app.services.context_window import trim_to_context_window
+from app.services.context_window import estimate_tokens, trim_to_context_window
+from app.services.rag import NO_EVIDENCE_MESSAGE, CitedSource, SourcesEvent, assign_source_ids, build_grounded_system_prompt, extract_valid_citations
+from app.services.retrieval import DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_K, RetrievalService
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +57,34 @@ class ConversationNotFoundError(LookupError):
         self.conversation_id = conversation_id
 
 
+class RagUnavailableError(LookupError):
+    """A collection_id was supplied but no embedding-capable provider is
+    configured (see EmbeddingService's lazy resolution) -- distinct from
+    ProviderNotFoundError so the API route can give a specific, honest
+    error rather than a generic "provider not configured" that would
+    misleadingly point at the *chat* model."""
+
+
 @dataclass
 class PreparedTurn:
     conversation_id: UUID
     model_id: str
     provider: Provider
     request: CompletionRequest
+    # None: this turn has no collection selected (ordinary CP-04 chat,
+    # unaffected). []: a collection was selected but nothing survived the
+    # similarity threshold. Non-empty: real, retrieved, citable evidence.
+    sources: list[CitedSource] | None = None
+    # Set only for the "no evidence passed threshold" short-circuit
+    # (STEP 23) -- when set, stream_reply never calls the provider at all.
+    deterministic_text: str | None = None
 
 
 class ChatService:
-    def __init__(self, model_registry: ModelRegistry, provider_registry: ProviderRegistry) -> None:
+    def __init__(self, model_registry: ModelRegistry, provider_registry: ProviderRegistry, retrieval: RetrievalService | None = None) -> None:
         self._models = model_registry
         self._providers = provider_registry
+        self._retrieval = retrieval
 
     async def prepare_turn(
         self,
@@ -75,6 +94,9 @@ class ChatService:
         conversation_id: UUID,
         user_content: str,
         model_id: str,
+        collection_id: UUID | None = None,
+        top_k: int = DEFAULT_TOP_K,
+        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ) -> PreparedTurn:
         # Raises ModelNotFoundError / ProviderNotFoundError (both already
         # defined, both already safe-to-surface LookupErrors) if the
@@ -93,12 +115,38 @@ class ChatService:
         await messages.create(conversation_id=conversation_id, role=Role.USER, content=[TextBlock(text=user_content)])
         await conversations.touch(conversation_id)
 
+        sources: list[CitedSource] | None = None
+        deterministic_text: str | None = None
+        system_prompt: str | None = None
+        reserved_tokens = DEFAULT_MAX_OUTPUT_TOKENS
+
+        if collection_id is not None:
+            if self._retrieval is None:
+                raise RagUnavailableError("no embedding-capable provider is configured")
+            retrieved = await self._retrieval.retrieve(
+                chunk_repository=ChunkRepository(conn, tenant),
+                collection_id=collection_id,
+                query=user_content,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+            )
+            sources = assign_source_ids(retrieved)
+            if not sources:
+                # STEP 23: retrieval itself already tells us there is no
+                # grounding evidence -- the provider is never called, so
+                # nothing is spent generating a response we'd have had to
+                # discard anyway.
+                deterministic_text = NO_EVIDENCE_MESSAGE
+            else:
+                system_prompt = build_grounded_system_prompt(sources)
+                reserved_tokens += estimate_tokens(Message(role=Role.USER, content=[TextBlock(text=system_prompt)]))
+
         history = await messages.list_for_conversation(conversation_id)
         normalized_history = [Message(role=m.role, content=m.content) for m in history]
         trimmed = trim_to_context_window(
             normalized_history,
             context_window=model_config.context_window,
-            reserved_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+            reserved_output_tokens=reserved_tokens,
         )
 
         # CompletionRequest.model is what an adapter sends upstream as-is
@@ -111,10 +159,28 @@ class ChatService:
         # PreparedTurn.model_id stays the internal id -- that's what gets
         # persisted on the assistant message for observability (see
         # docs/DESIGN.md, "Provider Switching").
-        request = CompletionRequest(model=model_config.provider_model_id, messages=trimmed, max_tokens=DEFAULT_MAX_OUTPUT_TOKENS)
-        return PreparedTurn(conversation_id=conversation_id, model_id=model_id, provider=provider, request=request)
+        request = CompletionRequest(
+            model=model_config.provider_model_id, messages=trimmed, system=system_prompt, max_tokens=DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        return PreparedTurn(
+            conversation_id=conversation_id,
+            model_id=model_id,
+            provider=provider,
+            request=request,
+            sources=sources,
+            deterministic_text=deterministic_text,
+        )
 
     async def stream_reply(self, prepared: PreparedTurn, *, pool: asyncpg.Pool, tenant: TenantContext) -> AsyncIterator[StreamEvent]:
+        if prepared.sources is not None:
+            yield SourcesEvent(sources=prepared.sources)
+
+        if prepared.deterministic_text is not None:
+            yield TextDeltaEvent(text=prepared.deterministic_text)
+            yield DoneEvent(finish_reason=FinishReason.STOP)
+            await self._persist_assistant_message(pool, tenant, prepared, prepared.deterministic_text, status="complete")
+            return
+
         accumulated_text = ""
         saw_done = False
         try:
@@ -161,6 +227,15 @@ class ChatService:
         else:
             if accumulated_text:
                 status = "complete" if saw_done else "interrupted"
+                if prepared.sources:
+                    # Belt-and-suspenders check (STEP 21) on top of the
+                    # structural guarantee that already prevents fabricated
+                    # citations: the model literally has no channel to add
+                    # an entry to `prepared.sources` (it's built server-side
+                    # in prepare_turn, before generation starts), so this
+                    # is diagnostic, not the actual enforcement mechanism.
+                    cited = extract_valid_citations(accumulated_text, prepared.sources)
+                    logger.debug("cited sources for conversation %s: %s", prepared.conversation_id, cited)
                 await self._persist_assistant_message(pool, tenant, prepared, accumulated_text, status=status)
 
     async def _persist_assistant_message(

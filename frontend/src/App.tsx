@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createConversation, listConversations } from "./api/conversations";
 import { fetchHealth } from "./api/health";
 import { ConversationList } from "./components/ConversationList";
+import { CollectionPanel } from "./components/CollectionPanel";
 import { Chat } from "./components/Chat";
 import type { ConversationSummary } from "./api/types";
 
@@ -15,6 +16,11 @@ function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadingConversations, setLoadingConversations] = useState(false);
+  // Persists across conversation switches on purpose -- "I'm working
+  // with the Handbook collection" is independent of which conversation
+  // is open, unlike model selection (which lives inside Chat and resets
+  // per conversation).
+  const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchHealth()
@@ -56,15 +62,18 @@ function App() {
         </label>
       </header>
       <div className="layout">
-        <ConversationList
-          conversations={conversations}
-          selectedId={selectedId}
-          onSelect={setSelectedId}
-          onCreate={handleCreateConversation}
-          loading={loadingConversations}
-        />
+        <div className="sidebar">
+          <ConversationList
+            conversations={conversations}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            onCreate={handleCreateConversation}
+            loading={loadingConversations}
+          />
+          <CollectionPanel tenantId={tenantId} selectedCollectionId={selectedCollectionId} onSelectCollection={setSelectedCollectionId} />
+        </div>
         {selectedId ? (
-          <Chat key={selectedId} tenantId={tenantId} conversationId={selectedId} />
+          <Chat key={selectedId} tenantId={tenantId} conversationId={selectedId} collectionId={selectedCollectionId} />
         ) : (
           <section className="chat chat-empty">
             <p>Create a conversation to get started.</p>

@@ -19,7 +19,8 @@ from app.schemas.conversations import (
     MessageResponse,
     SendMessageRequest,
 )
-from app.services.chat import ChatService, ConversationNotFoundError
+from app.services.chat import ChatService, ConversationNotFoundError, RagUnavailableError
+from app.services.rag import SourcesEvent
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ async def get_conversation(
     )
 
 
-def _format_sse(event: StreamEvent) -> str:
+def _format_sse(event: StreamEvent | SourcesEvent) -> str:
     # The event's own `type` discriminator (text_delta, tool_use_start,
     # ..., done, error -- see app/providers/contracts.py) IS the
     # provider-neutral SSE event name the assignment asks for; no separate
@@ -95,7 +96,14 @@ async def stream_message(
     async with tenant_connection(pool, tenant) as conn:
         try:
             prepared = await chat_service.prepare_turn(
-                conn=conn, tenant=tenant, conversation_id=conversation_id, user_content=body.content, model_id=body.model
+                conn=conn,
+                tenant=tenant,
+                conversation_id=conversation_id,
+                user_content=body.content,
+                model_id=body.model,
+                collection_id=body.collection_id,
+                top_k=body.top_k,
+                similarity_threshold=body.similarity_threshold,
             )
         except ConversationNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Conversation not found") from exc
@@ -103,6 +111,8 @@ async def stream_message(
             raise HTTPException(status_code=400, detail=f"Unknown model '{exc.model_id}'") from exc
         except ProviderNotFoundError as exc:
             raise HTTPException(status_code=503, detail=f"Provider '{exc.provider_id}' is not configured") from exc
+        except RagUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     async def event_source() -> AsyncIterator[str]:
         async for event in chat_service.stream_reply(prepared, pool=pool, tenant=tenant):

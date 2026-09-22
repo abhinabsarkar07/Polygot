@@ -65,3 +65,26 @@ models:
       # Gemini context-caching pricing not confirmed from an official
       # source yet -- left unset rather than guessed. Populate during CP-03.
       cached_input_per_million: null
+
+  # CP-05's one embedding model (see docs/PROVIDER_NOTES.md's new
+  # "Embeddings" section for full sourcing). Chosen over Gemini/Anthropic
+  # embeddings specifically because the OpenAI SDK is already installed
+  # and already used for chat (app/providers/openai_adapter.py) -- no new
+  # dependency, and OpenAIAdapter.embed() (see that file) is a direct
+  # override of the Provider.embed() default CP-02 already defined,
+  # reusing ProviderRegistry/credential-driven availability rather than a
+  # second, parallel embedding-provider registry.
+  text-embedding-3-small:
+    provider: openai
+    provider_model_id: text-embedding-3-small
+    context_window: 8192
+    dimension: 1536
+    capabilities:
+      streaming: false
+      tools: false
+      vision: false
+      embeddings: true
+      reasoning: false
+    pricing:
+      input_per_million: 0.02
+      output_per_million: null

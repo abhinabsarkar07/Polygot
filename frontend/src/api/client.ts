@@ -22,11 +22,17 @@ async function parseErrorDetail(response: Response): Promise<string> {
 /** Every request carries the tenant identity as the unsigned `X-Tenant-Id`
  * header CP-01 established -- never a body field, never a query param. */
 export async function apiFetch(path: string, tenantId: string, init: RequestInit = {}): Promise<Response> {
+  // A FormData body (multipart upload -- see api/collections.ts) must
+  // NOT get an explicit Content-Type: the browser sets
+  // "multipart/form-data; boundary=..." itself, with a boundary value
+  // only it knows: an explicit "application/json" here would silently
+  // break every upload's request body.
+  const isFormData = typeof FormData !== "undefined" && init.body instanceof FormData;
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
       "X-Tenant-Id": tenantId,
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.body && !isFormData ? { "Content-Type": "application/json" } : {}),
       ...init.headers,
     },
   });

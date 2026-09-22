@@ -27,16 +27,29 @@ export async function getConversation(tenantId: string, conversationId: string):
  * the underlying fetch, which the backend's disconnect detection turns
  * into real upstream cancellation (see docs/DESIGN.md, "Cancellation").
  */
+export interface RagOptions {
+  collectionId: string;
+  topK: number;
+  similarityThreshold: number;
+}
+
 export async function* streamMessage(
   tenantId: string,
   conversationId: string,
   content: string,
   model: string,
   signal: AbortSignal,
+  rag?: RagOptions,
 ): AsyncGenerator<StreamEvent> {
+  const body: Record<string, unknown> = { content, model };
+  if (rag) {
+    body.collection_id = rag.collectionId;
+    body.top_k = rag.topK;
+    body.similarity_threshold = rag.similarityThreshold;
+  }
   const response = await apiFetch(`/api/conversations/${conversationId}/messages/stream`, tenantId, {
     method: "POST",
-    body: JSON.stringify({ content, model }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!response.body) return;

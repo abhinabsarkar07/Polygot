@@ -393,3 +393,83 @@ until the actual timing was checked correctly -- confirming it live,
 rather than trusting the theory, is what caught that near-miss too).
 Every one of these bugs would have shipped invisibly in a submission that
 only ran the (extensive, and otherwise accurate) automated test suite.
+
+## CP-05 -- RAG, document upload, retrieval, grounded citations
+
+**Decision, deviating from the checkpoint's own suggested design:** the
+checkpoint's instructions describe a new `EmbeddingProvider` abstraction
+(`embed_documents`/`embed_query`). Claude built `EmbeddingService` as a
+thin wrapper over the *existing* `Provider.embed()` method instead --
+CP-02 already defined that method on the core `Provider` interface,
+specifically anticipating an embedding-capable adapter overriding a
+default that raises `UNSUPPORTED`. Building a second, parallel
+provider-resolution mechanism would have duplicated
+`ProviderRegistry`'s credential-driven availability and `ProviderError`
+normalization for no real benefit. This is a considered deviation, not an
+oversight -- documented in `docs/DESIGN.md` and `docs/PROVIDER_NOTES.md`
+with the reasoning, in case it's asked about directly.
+
+**Self-caught bug 1 (found via test flakiness, not immediately):** the
+first full test-suite run after adding CP-05 code failed exactly one
+test -- chunk ordering came back reversed (`[3,2,1,0]` instead of
+`[0,1,2,3]`) -- despite that same test passing when run in isolation
+moments earlier. Root cause: `ChunkRepository.list_for_collection_with_filenames`
+had no `ORDER BY` clause at all, so Postgres made no row-order guarantee;
+it happened to come back in insertion order against an empty table and
+stopped doing so once the table held rows from other tests too. Fixed by
+adding an explicit `ORDER BY document_id, chunk_index` -- correct
+practice regardless (retrieval re-sorts by similarity afterward anyway,
+so this was always latent, just invisible until the table had enough
+data in it to expose Postgres's actual, undefined ordering).
+
+**Self-caught bug 2, found the same way, immediately after:** the fix for
+bug 1 also surfaced that the same "worked in isolation, not against a
+fuller database" pattern had left ~340 rows of accumulated test data
+(collections, chunks) sitting in the real dev database -- the test
+suite's autouse cleanup fixture (`tests/conftest.py`) truncated
+`notes`/`messages`/`conversations` (CP-01/04) but was never extended to
+include the three new CP-05 tables. Not a functional bug (each test uses
+its own randomly-generated UUIDs, so cross-test pollution never produced
+a false pass or fail), but genuine hygiene debt -- fixed by adding
+`chunks, documents, collections` to the same `TRUNCATE` statement, and
+the accumulated rows were cleared out of the dev database directly
+(disposable, entirely test-generated data).
+
+**Preventive fix applied proactively, not reactively:** `EmbeddingService`
+was written from the start to resolve its provider *lazily* (inside
+`embed_documents`/`embed_query`, not in `__init__`) rather than eagerly,
+specifically because CP-04 had already shown what happens when a
+provider-backed service resolves eagerly at construction time: it
+crashes application *startup* the moment that provider's API key is
+unset, not just the feature that needed it. `app/main.py` constructs
+`EmbeddingService` unconditionally, the same way it constructs
+`ChatService` -- an eager `provider_registry.get("openai")` inside
+`EmbeddingService.__init__` would have reintroduced exactly the failure
+mode CP-03/04's wiring (`build_provider_registry`) was built to prevent.
+Caught by applying the earlier lesson before writing the code, not by
+hitting the crash first.
+
+**Self-caught bug 3 (found immediately via test failures, not live):** a
+test fixture (`FakeEmbeddingProvider`, written for these tests only) used
+`hashlib.sha256(text).digest()[:dimension]` to produce deterministic fake
+vectors -- but SHA-256 digests are only 32 bytes, so requesting a
+1536-dimension vector (the real, schema-enforced size) silently returned
+only 32 elements, tripping the `chunks_embedding_dimension` CHECK
+constraint the moment any test used the real dimension instead of a
+toy one. Fixed by seeding a `random.Random` instance from the hash
+instead of slicing it directly, which can produce a vector of any
+requested length deterministically.
+
+**Manual verification finding, live:** with no `OPENAI_API_KEY`
+configured, a real document upload against the running app returned a
+clean `{"status": "failed", "error": "no embedding provider is
+configured"}` -- but only after `IngestionService.ingest()` was
+specifically checked and found to catch `ProviderError` (a configured
+provider failing) without also catching `ProviderNotFoundError` (no
+provider configured at all, a different, unrelated exception hierarchy
+from CP-02/03). Without that second `except` clause, an unconfigured
+embedding provider would have produced an uncaught exception reaching
+the route as a generic 500, not the deliberate `failed`-status document
+STEP 14 calls for. Fixed before this was ever exercised by a real
+request with a missing key; confirmed by then actually removing the key
+and uploading a real file against the live server.

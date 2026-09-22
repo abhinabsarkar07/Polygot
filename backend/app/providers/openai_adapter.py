@@ -139,6 +139,18 @@ class OpenAIAdapter(Provider):
             logger.debug("openai stream error: %s", exc)
             yield ErrorEvent(kind=error.kind, message=error.message)
 
+    async def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
+        # Overrides Provider.embed()'s UNSUPPORTED-raising default (CP-02)
+        # -- OpenAI is the one configured provider that actually does
+        # embeddings (see app/providers/models.yaml). CP-05's RAG services
+        # call this through ProviderRegistry, exactly like chat calls
+        # complete()/stream() -- never `openai.AsyncOpenAI(...)` directly.
+        try:
+            response = await self._client.embeddings.create(input=texts, model=model)
+        except Exception as exc:  # noqa: BLE001 -- translated immediately below
+            raise self._translate_error(exc) from exc
+        return [item.embedding for item in response.data]
+
     # --- Request translation -------------------------------------------------
 
     def _build_request(self, request: CompletionRequest) -> dict:
