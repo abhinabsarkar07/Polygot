@@ -1,9 +1,90 @@
-# AI Usage Log
+# AI Usage
 
-This project was built with Claude Code as a pair-programming assistant.
-This log is written as we go, not reconstructed afterward. Entries record
-what Claude did, and specifically where its output or actions were
-rejected or corrected.
+## Tools Used
+
+Claude Code (Claude Sonnet 5), used as an interactive pair-programming
+assistant for the full build, checkpoint by checkpoint, with explicit
+human authorization required between checkpoints. No other AI coding
+tool was used.
+
+## Where AI Was Used
+
+Across every layer of this project: initial requirements/architecture
+analysis (CP-00); the FastAPI/PostgreSQL/RLS foundation (CP-01); the
+provider-neutral contracts, registry, and model configuration (CP-02);
+all three provider adapters -- Anthropic, Gemini, OpenAI (CP-03); SSE
+streaming, cancellation, and the React chat UI (CP-04); RAG ingestion,
+retrieval, and grounded citations (CP-05); observability, cost
+accounting, retry/fallback resilience, and the security review (CP-06);
+and this documentation pass itself (CP-07). Test generation happened
+alongside every checkpoint's implementation, not as an afterthought.
+
+## Human Review Process
+
+Every checkpoint's output was read, not just accepted: code was
+inspected line by line where it mattered (especially the tenant-boundary
+and streaming-retry-safety logic), the full test suite was run and its
+results checked rather than trusted from a summary, provider SDK claims
+were checked against the actually-installed SDK's source rather than
+Claude's training-data memory (see the CP-03 entry below), and manual
+end-to-end verification was performed against a real Anthropic API key
+during CP-04 specifically because unit tests alone had already been
+shown to miss real, load-bearing bugs (see "Cancellation" in
+`docs/DESIGN.md` for what that live pass caught). Checkpoints were
+gated behind explicit human authorization ("Proceed to CP-0X") rather
+than run end-to-end unsupervised.
+
+## Corrections / Rejections
+
+The entries below are real, written as the project was built, not
+reconstructed after the fact -- including the checkpoints where nothing
+needed correcting, stated as such rather than omitted. The most
+significant ones, for a fast read:
+
+- **CP-00**: an assumed Node/Fastify backend was rejected once the real
+  stack (Python/FastAPI) was specified -- redone in full, not patched.
+- **CP-03**: adapter code was built by reading the *installed* SDK
+  source, after training-data assumptions about SDK shape were
+  deliberately not trusted (SDKs change between major versions).
+- **CP-04**: three real bugs -- a raw provider exception body reaching
+  the browser, cancellation silently persisting nothing, and a context-
+  window edge case -- were found only by live-testing against a real
+  Anthropic key, none of them caught by the (extensive, otherwise
+  accurate) unit test suite. See `docs/DESIGN.md`'s "Cancellation" for
+  the technical mechanism.
+- **CP-05**: citation metadata was made server-authoritative (the model
+  only ever emits a bracketed id) rather than trusting model-reported
+  filenames/pages, specifically to make fabricated citation metadata
+  structurally impossible rather than merely unlikely.
+- **CP-06**: a shared test-cleanup fixture missing a new table caused a
+  suite-wide false-failure signature -- the same *class* of mistake as a
+  CP-05 bug, recurring with the same shape; a `Settings`-driven message
+  cap was self-corrected before shipping once a Pydantic timing
+  constraint became clear; cached-token cost pricing was deliberately
+  left unpriced rather than guessed, once the semantics couldn't be
+  confirmed live within the time box.
+
+Full detail for every entry, including ones not summarized above, is in
+the checkpoint-by-checkpoint log below.
+
+## Limitations
+
+AI assistance does not replace understanding of the submitted code. Every
+architectural decision recorded in `docs/DESIGN.md`, every provider
+quirk in `docs/PROVIDER_NOTES.md`, and every correction below was
+reviewed and can be explained and defended without this log open --
+`docs/INTERVIEW_NOTES.md` is the concrete proof of that, prepared
+independently of this file. This log is a factual record of what
+happened during development, not a substitute for knowing why the
+resulting code is correct.
+
+---
+
+## AI Usage Log (chronological, by checkpoint)
+
+This section is written as the project was built, checkpoint by
+checkpoint, not reconstructed afterward. Entries record what Claude did,
+and specifically where its output or actions were rejected or corrected.
 
 ## CP-00 -- Requirements analysis
 
@@ -523,7 +604,7 @@ guessed paths.
 
 **A note on scope, stated rather than left implicit:** cached-token cost
 pricing was deliberately left unimplemented (`Usage.cached_input_tokens`
-is captured but not priced -- see `docs/DESIGN.md`, "Cost Accounting")
+is captured but not priced -- see `docs/DESIGN.md`, "Observability")
 because Anthropic's and OpenAI's cached-token accounting semantics were
 never confirmed against a live response inside the time box, and a wrong
 guess in either direction would silently corrupt a dollar figure. This

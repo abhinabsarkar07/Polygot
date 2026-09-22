@@ -19,8 +19,16 @@ completion (`claude-sonnet` -> `claude-sonnet-5`, tokens genuinely
 streamed and rendered incrementally), and a real mid-generation
 cancellation, all against the live API -- see `docs/AI_USAGE.md`'s CP-04
 section for the three real bugs that live pass surfaced (none of them
-were in the adapter itself; see below). Gemini and OpenAI remain
-fixture-tested only -- no key was available to verify them live.
+were in the adapter itself; see below). **Gemini and OpenAI *chat*
+adapters remain fixture-tested only** -- never exercised against a live
+key. A real `OPENAI_API_KEY` was added to the environment during CP-05,
+but the only live exercise it actually received was the *negative* path
+-- confirming a clean `status: "failed", error: "no embedding provider is
+configured"` with the key unset (see `docs/AI_USAGE.md`'s CP-05 section,
+"Manual verification finding, live"). A real successful embeddings call
+(and therefore real end-to-end RAG retrieval/citations against live
+embeddings) was never performed -- stated here plainly rather than
+implied by the key having existed at some point.
 
 ---
 
@@ -606,9 +614,9 @@ does exactly that (`OpenAIAdapter.embed()`, calling
 `app/services/embeddings.py::EmbeddingService`, a thin wrapper offering
 `embed_documents`/`embed_query`, which itself calls `Provider.embed()`
 through the *same* `ProviderRegistry` chat already uses. See
-`docs/DESIGN.md`'s CP-02 section for the tradeoff this avoided (a second
-resolution/credential-availability mechanism duplicating what already
-exists).
+`docs/DESIGN.md`, "Provider Abstraction" ("Why `embed()` isn't abstract")
+for the tradeoff this avoided (a second resolution/credential-availability
+mechanism duplicating what already exists).
 
 ## Configuration
 
@@ -643,6 +651,12 @@ request; there is no partial-embedding state to reconcile.
 
 ## Live- vs Fixture-Tested
 
-Not live-tested during initial CP-05 development -- see `docs/AI_USAGE.md`
-for whether this was verified against the real API afterward and what
-that verification found.
+**Fixture-tested only, stated plainly.** `EmbeddingService`/`OpenAIAdapter.embed()`
+have never been exercised against a real, successful OpenAI API response
+in this project. The one live exercise this path received was the
+*negative* case -- confirming that an unconfigured embedding provider
+fails cleanly (`status: "failed"`) rather than crashing -- not a real
+embedding call. A reviewer relying on this project's RAG feature working
+against real embeddings should run their own smoke test with a real
+`OPENAI_API_KEY` before trusting it end-to-end; see README.md's Quick
+Start.

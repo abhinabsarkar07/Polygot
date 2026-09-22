@@ -1,46 +1,156 @@
-# Polyglot -- Multi-Provider AI Workbench
+# Polyglot
 
-**Status: CP-05.** A working end-to-end chat workbench with retrieval-
-augmented generation: create a conversation, pick a model (Anthropic,
-Gemini, or OpenAI -- whichever have API keys configured), send a message,
-watch the reply stream in token by token, stop generation mid-stream,
-switch providers between turns, reload without losing anything -- and
-now, upload documents (PDF/TXT/Markdown) into a collection, select that
-collection for a conversation, and get answers grounded in your own
-documents with inline, inspectable citations. All of it is tenant-
-isolated at the database level.
+A multi-provider AI chat workbench: pick Anthropic, Gemini, or OpenAI per
+turn behind one normalized internal contract, stream real token-by-token
+replies over SSE, ground answers in your own uploaded documents with
+server-authoritative citations, and see per-turn cost/latency with
+automatic retry and fallback when a provider hiccups -- all of it
+structurally isolated per tenant at the database level, not just by
+convention.
 
-**Not yet built:** tool execution, retries/fallback, usage/cost
-dashboards. See `docs/DESIGN.md` for what's planned and not yet started.
+## What Is Implemented
+
+- **Chat**: persistent conversations, real streaming (not simulated),
+  mid-generation cancellation that reaches the upstream provider
+  connection, provider/model switching turn-to-turn with coherent history.
+- **Providers**: Anthropic, Gemini, and OpenAI behind one normalized
+  contract, zero provider-name branching in application code (verified,
+  not just claimed -- see "Architecture").
+- **RAG**: document upload (.txt/.md/.pdf) into collections, configurable
+  chunking, embeddings, tenant/collection-scoped retrieval, grounded
+  generation with server-authoritative citations, a deterministic
+  "no evidence" path that never calls the model unnecessarily.
+- **Observability**: TTFT, latency, token counts, and cost per turn;
+  tenant-scoped `GET /api/usage/summary`.
+- **Resilience**: retry with exponential backoff (eligible errors only),
+  config-driven fallback chains, per-attempt timeouts -- all gated by an
+  explicit safety rule: never retry or fall back once real output has
+  streamed to the browser.
+- **Multi-tenancy**: PostgreSQL row-level security enforces tenant
+  isolation on every tenant-owned table; not an application-level filter
+  that could be forgotten.
+
+**Not implemented:** tool execution (Module D -- see "Scope / Assignment
+Status"), per-tenant rate limiting, semantic caching, hybrid search,
+reranking, an evaluation framework, OCR.
+
+## Architecture
+
+```
+React/Vite  --HTTP/SSE-->  FastAPI  --X-Tenant-Id-->  Postgres (RLS)
+                               |
+                          ChatService / RAG
+                               |
+                          ModelRegistry (models.yaml)
+                               |
+                          ProviderRegistry
+                          /      |       \
+                  Anthropic   Gemini    OpenAI
+                  Adapter     Adapter   Adapter
+```
+
+Application code (chat orchestration, RAG, API routes) depends only on a
+normalized `CompletionRequest`/`StreamEvent`/`Provider` contract -- never
+on a provider SDK type or a provider-name branch. Full diagram, request
+flow, and the reasoning behind every major decision are in
+`docs/DESIGN.md`.
+
+## Tech Stack
+
+- React + TypeScript + Vite (frontend)
+- Python + FastAPI (backend)
+- PostgreSQL 16 with row-level security (persistence + hand-rolled vector
+  store -- no pgvector; see `docs/DESIGN.md`, "Design Decisions")
+- Provider SDKs: `anthropic`, `google-genai`, `openai`
+
+## Providers
+
+| Provider | Adapter | Streaming | Tools Normalized | Live Tested |
+| --- | --- | --- | --- | --- |
+| Anthropic | `anthropic_adapter.py` | Yes | Yes | **Yes** -- real streamed reply, real mid-generation Stop, real auth failure |
+| Gemini | `gemini_adapter.py` | Yes | Yes | No -- fixture-tested only |
+| OpenAI (chat) | `openai_adapter.py` | Yes | Yes | No -- fixture-tested only |
+| OpenAI (embeddings) | `openai_adapter.py::embed()` | n/a | n/a | No -- only the "no key configured" failure path was exercised live; a real successful embedding call was never performed |
+
+"Tools Normalized" means each adapter translates the provider's native
+tool-call streaming events into `ToolUseStartEvent`/`ToolUseDeltaEvent`/
+`ToolUseCompleteEvent`. No application-level tool execution loop exists
+yet -- see "Scope / Assignment Status".
 
 ## Prerequisites
 
-- **Node.js** 20+ and npm (frontend)
-- **Python** 3.11+ (backend). On Windows, if the bare `python`/`pip`
-  commands resolve to the Microsoft Store stub instead of a real
-  interpreter, use the `py` launcher instead (`py -m venv`, etc.), as the
-  commands below do.
-- **PostgreSQL** 16, running locally and reachable on `localhost:5432`.
-  No pgvector required -- see "RAG / vector storage" below for why.
+- **Node.js** 20+ and npm
+- **Python** 3.11+. On Windows, if bare `python`/`pip` resolve to the
+  Microsoft Store stub, use the `py` launcher instead (`py -m venv`,
+  etc.), as the commands below do.
+- **PostgreSQL 16**, running locally and reachable on `localhost:5432`.
 - **At least one chat provider API key** (Anthropic, Gemini, or OpenAI)
-  to send a message and see a real reply. Without one, the app still runs
-  fully -- conversations, the model list, and tenant isolation all work --
-  but sending a message to an unconfigured provider returns a clean
-  `503`, not a crash.
-- **An OpenAI API key** specifically, to actually use RAG (document
-  upload embeds via `text-embedding-3-small`; see "RAG / embeddings"
-  below). Without it, uploads fail cleanly with
-  `{"status": "failed", "error": "no embedding provider is configured"}`
-  -- not a crash, and not silently accepted.
+  to send a message and see a real reply. Without one, the app still
+  runs fully -- conversations, the model list, and tenant isolation all
+  work -- but sending a message to an unconfigured provider returns a
+  clean `503`, not a crash.
+- **An OpenAI API key** specifically, to use RAG (embeds via
+  `text-embedding-3-small`). Without it, uploads fail cleanly with
+  `{"status": "failed", "error": "no embedding provider is configured"}`.
 
-## Database setup
+## Quick Start
+
+From a clean clone, in order:
+
+```bash
+# 1. Environment
+cp .env.example backend/.env
+# edit backend/.env: set DATABASE_URL and whichever provider API key(s) you have
+
+# 2. Database (see "Database Setup" below if PostgreSQL isn't installed yet)
+#    Tables/RLS policies/dev tenant seed data are created automatically
+#    on first backend start -- no separate migration command.
+
+# 3. Backend
+cd backend
+py -m venv .venv
+./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+./.venv/Scripts/python.exe -m uvicorn app.main:app --reload
+# -> http://localhost:8000 ; GET /api/health should return {"status": "ok"}
+
+# 4. Frontend (separate terminal)
+cd frontend
+npm install
+npm run dev
+# -> open the printed URL, default http://localhost:5173
+```
+
+Total setup time on a machine with PostgreSQL already installed is well
+under five minutes; installing PostgreSQL itself (see below) adds a few
+more.
+
+## Environment Variables
+
+`.env.example` (repo root) lists every variable with a placeholder value
+-- copy it to `backend/.env` and fill in real values there; `backend/.env`
+is gitignored and never committed.
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `DATABASE_URL` | Yes | `postgresql://polyglot_app:<password>@localhost:5432/polyglot` |
+| `FRONTEND_ORIGIN` | No | CORS origin, defaults to `http://localhost:5173` |
+| `ANTHROPIC_API_KEY` | No | One of the three provider keys, each independent |
+| `GEMINI_API_KEY` | No | " |
+| `OPENAI_API_KEY` | No | Also required for RAG (embeddings) regardless of chat model |
+
+Retry/timeout tuning (`RETRY_MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`,
+`RETRY_MAX_DELAY_SECONDS`, `PROVIDER_REQUEST_TIMEOUT_SECONDS`) and the
+upload size cap (`MAX_UPLOAD_BYTES`) all have sane defaults (see
+`backend/app/core/config.py`) and don't need to be set for local use.
+
+## Database Setup
 
 The app expects a dedicated, non-superuser Postgres role that owns its
-own database (this is what makes row-level security actually enforce --
-see `docs/DESIGN.md`).
+own database -- this is what makes row-level security actually enforce
+(see `docs/DESIGN.md`, "Multi-Tenancy").
 
-**If you don't have PostgreSQL installed yet** (Windows, via winget --
-adjust for your platform's package manager otherwise):
+**If PostgreSQL isn't installed yet** (Windows, via winget -- adjust for
+your platform's package manager otherwise):
 
 ```powershell
 winget install --id PostgreSQL.PostgreSQL.16 --silent `
@@ -59,131 +169,28 @@ $env:PGPASSWORD = "<THE_SUPERUSER_PASSWORD_FROM_ABOVE>"
   -c "CREATE DATABASE polyglot OWNER polyglot_app;"
 ```
 
-Tables, row-level security policies, and dev tenant seed data are created
-automatically the first time the backend starts (see `app/db/migrate.py`
-and `app/db/seed.py`) -- there is no separate "run migrations" step.
+Tables, row-level security policies, and dev tenant seed data (`tenant-a`,
+`tenant-b`) are created automatically the first time the backend starts
+(`app/db/migrate.py`, `app/db/seed.py`) -- there is no separate "run
+migrations" step.
 
-## Environment setup
-
-```bash
-cp .env.example backend/.env
-```
-
-Edit `backend/.env` and set `DATABASE_URL` to match the role/password you
-created above, e.g.:
-
-```
-DATABASE_URL=postgresql://polyglot_app:polyglot_dev_local_2026@localhost:5432/polyglot
-```
-
-Set whichever of `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`
-you have -- each is independent; a provider with no key configured is
-simply unavailable, not a startup error. `OPENAI_API_KEY` additionally
-enables RAG document upload regardless of which chat model you use (see
-"RAG / embeddings" below).
-
-## Backend setup and run
+## Backend
 
 ```bash
 cd backend
-py -m venv .venv
-./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 ./.venv/Scripts/python.exe -m uvicorn app.main:app --reload
 ```
 
-The API is now on `http://localhost:8000`. `GET /api/health` should
-return `{"status": "ok"}`.
-
-## Frontend setup and run
+## Frontend
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Open the printed URL (default `http://localhost:5173`).
+## Tests
 
-## Using the chat UI
-
-1. The **Tenant** field at the top defaults to `tenant-a` (a dev tenant
-   seeded automatically -- `tenant-b` also exists, and has no access to
-   `tenant-a`'s conversations, collections, or documents, or vice versa;
-   see "Tenant identifier" below).
-2. Click **+ New Conversation**.
-3. Pick a model from the dropdown.
-4. Type a message and press Enter (or click Send). Tokens stream in as
-   they arrive from the real provider.
-5. Click **Stop** while generating to cancel -- reaches the upstream
-   provider connection, not just the browser (see `docs/DESIGN.md`,
-   "Cancellation").
-6. Switch the model dropdown before the next message to route that turn
-   to a different provider, keeping the full conversation coherent.
-7. Refresh and reselect the conversation -- same history, including
-   whether any reply was cut short (marked "stopped").
-
-## Using RAG (documents)
-
-1. In the **Documents (RAG)** panel, click **Create** to make a new
-   collection (or pick an existing one from the dropdown).
-2. Set **chunk size**/**overlap** if you want something other than the
-   defaults (1000 characters / 150 overlap), then choose a `.txt`, `.md`,
-   or `.pdf` file and click **Upload**. The document list shows its
-   status: `processing` -> `ready` or `failed` (with a reason -- a
-   scanned PDF with no text layer fails honestly here, it is not OCR'd).
-3. With a collection selected, send a chat message as usual. The reply is
-   answered only from that collection's evidence, streamed exactly like
-   ordinary chat, with a **Sources** list underneath -- click a source
-   chip (`[S1]`, `[S2]`, ...) to see its filename, chunk index, page (PDF
-   only), similarity score, and the actual retrieved text.
-4. **Top-K**/**similarity threshold** (shown once a collection is
-   selected) control retrieval per-query, independent of the chunk
-   size/overlap used at upload time -- re-querying with different values
-   never requires re-uploading anything.
-5. If no chunk in the collection meets the similarity threshold, the
-   reply is a deterministic "I don't know based on the provided
-   documents." -- the model is never called in that case (see
-   `docs/DESIGN.md`, "No-Evidence Behavior").
-6. Select "No collection (plain chat)" to go back to ordinary,
-   non-grounded chat at any time.
-
-## RAG / embeddings
-
-One embedding model is configured: OpenAI's `text-embedding-3-small`
-(1536 dimensions, $0.02/MTok -- see `docs/PROVIDER_NOTES.md`'s
-"Embeddings" section for full sourcing). Chosen because the OpenAI SDK
-was already installed and used for chat; embedding support is one
-additional method on the existing adapter (`OpenAIAdapter.embed()`), not
-a new provider or a second abstraction layer.
-
-## RAG / vector storage
-
-No pgvector -- checked directly against this project's native PostgreSQL
-install (not available; see `docs/DESIGN.md`'s CP-01 section for why
-Docker wasn't an option either). Embeddings are stored in a plain
-`double precision[]` Postgres column; similarity (cosine) is computed in
-Python over rows a tenant/collection-scoped SQL query (enforced by row-
-level security, same as every other table) already restricted -- never
-computed over, or filtered down from, another tenant's data. See
-`docs/DESIGN.md`'s "RAG Tenant Isolation" section for the exact guarantee
-and the adversarial test that proves it.
-
-## Configured models
-
-| Internal id | Provider | Needs |
-| --- | --- | --- |
-| `claude-sonnet` | Anthropic | `ANTHROPIC_API_KEY` |
-| `gpt-5.6-terra` | OpenAI | `OPENAI_API_KEY` |
-| `gemini-2.5-flash` | Gemini | `GEMINI_API_KEY` |
-| `text-embedding-3-small` | OpenAI (embeddings) | `OPENAI_API_KEY` |
-
-Real, sourced pricing and capabilities for each are in
-`backend/app/providers/models.yaml`; full API differences and sourcing in
-`docs/PROVIDER_NOTES.md`.
-
-## Running tests
-
-Requires the database from the steps above to be running (tests exercise
+Requires the database from "Database Setup" to be running (tests exercise
 real row-level-security behavior, not mocks). No provider API key is
 required -- all provider/adapter/embedding tests use fixtures, never a
 live call.
@@ -193,45 +200,90 @@ cd backend
 ./.venv/Scripts/python.exe -m pytest -v
 ```
 
-## Observability, cost, and resilience (CP-06)
+Frontend:
 
-Every chat turn writes one usage record (provider, requested vs. final
-model, TTFT, total latency, token counts, cost, retry count, whether
-fallback ran) -- never prompt/response text. `GET /api/usage/summary`
-returns a tenant-scoped, per-provider rollup (total cost, average
-latency, request count).
+```bash
+cd frontend
+npm run lint   # oxlint
+npm run build  # tsc -b && vite build -- typecheck + production build
+```
 
-- **Retry**: `rate_limit` and `server_error` failures are retried against
-  the same model with full-jitter exponential backoff (configurable via
-  `RETRY_MAX_RETRIES` / `RETRY_BASE_DELAY_SECONDS` / `RETRY_MAX_DELAY_SECONDS`),
-  but **only before any reply text has streamed to the browser**. Once a
-  `TextDeltaEvent` has gone out, a later failure is surfaced as an error
-  and never silently retried or replaced.
-- **Fallback**: each model can configure a priority-ordered
-  `fallback_model_ids` list (`backend/app/providers/models.yaml`) --
-  `claude-sonnet` falls back to `gemini-2.5-flash`. A fallback is only
-  taken pre-output, for the same error kinds as retry plus `timeout`; the
-  UI shows a "fallback from ..." badge when it happens.
-- **Timeout**: each provider attempt is bounded by
-  `PROVIDER_REQUEST_TIMEOUT_SECONDS` (default 60s); a timeout is a normal
-  fallback-eligible error, not a hang.
-- **Cost**: computed from reported token usage using `Decimal` math
-  (never binary floats) against `models.yaml`'s per-million pricing.
-  Cached-token pricing is a stated, deliberate gap -- see
-  `docs/DESIGN.md`, "Cost Accounting".
+## RAG
 
-Full detail (including the exact streaming-retry-safety boundary and the
-security review) is in `docs/DESIGN.md`'s CP-06 section.
+1. Create or select a **collection**.
+2. **Upload** a `.txt`, `.md`, or `.pdf` file, with optional chunk
+   size/overlap (defaults: 1000 chars / 150 overlap). Status goes
+   `processing` -> `ready` or `failed` (with a reason -- a scanned PDF
+   with no text layer fails honestly, it is not OCR'd).
+3. Select the collection for a conversation; replies are answered only
+   from that collection's evidence, streamed like ordinary chat, with a
+   **Sources** list of clickable citation chips (`[S1]`, `[S2]`, ...)
+   showing filename, chunk index, page (PDF only), similarity score, and
+   the actual retrieved text.
+4. **Top-K**/**similarity threshold** control retrieval per-query,
+   independent of upload-time chunk size/overlap.
+5. If nothing meets the similarity threshold, the reply is a
+   deterministic "I don't know based on the provided documents." -- the
+   model is never called in that case.
 
-## Tenant identifier (take-home simplification)
+Embeddings: OpenAI `text-embedding-3-small` (1536 dimensions, $0.02/MTok),
+reusing the same `Provider.embed()` interface chat already uses, not a
+second abstraction. Vector storage: a plain Postgres `double precision[]`
+column with cosine similarity computed in Python (no pgvector on this
+install) -- tenant/collection scoping happens entirely in SQL before any
+Python code sees a row. Full detail: `docs/DESIGN.md`, "RAG".
 
-Requests are scoped by an `X-Tenant-Id` header (e.g. `tenant-a` or
-`tenant-b`, both seeded automatically in development). This is
-intentionally simple and unsigned per the assignment's own guidance for a
-take-home -- see `docs/DESIGN.md` for what is and isn't protected by this,
-and what production authentication would replace it with.
+## Multi-Tenancy
 
-## Limitations (stated plainly)
+Requests are scoped by an `X-Tenant-Id` header (`tenant-a`/`tenant-b`,
+both seeded automatically). The header itself is unsigned and forgeable
+by design, per the assignment's own guidance for a take-home -- what's
+actually enforced is that once an identity is accepted, PostgreSQL
+row-level security (forced, not just enabled) makes cross-tenant reads
+and writes structurally impossible, adversarially tested, not just
+asserted. Full detail, including exactly what a new engineer would have
+to do to accidentally leak data (short answer: bypass the one connection
+helper that sets the tenant session variable, which stands out in
+review) is in `docs/DESIGN.md`, "Multi-Tenancy".
+
+## Streaming
+
+Real token-by-token streaming, not a simulated typewriter effect: the
+backend forwards each provider event over SSE the instant it arrives
+(`async for event in provider.stream(request): yield event`, all the way
+to the HTTP response), and the frontend consumes it with `fetch` + a
+hand-rolled SSE parser (`EventSource` can't POST, so it isn't used) that
+correctly buffers across arbitrary network chunk boundaries. Full detail:
+`docs/DESIGN.md`, "Streaming".
+
+## Observability
+
+Every completed or interrupted turn writes one usage record: provider,
+requested vs. final model, TTFT, total latency, token counts, cost
+(`Decimal`-precise), finish reason, retry count, fallback flag -- never
+prompt/response text. `GET /api/usage/summary` returns a tenant-scoped,
+per-provider rollup. Retry (eligible errors only, exponential backoff),
+fallback (config-driven model chain), and per-attempt timeouts all
+respect one non-negotiable rule: never retried or replaced once real
+output has streamed to the browser. Full detail: `docs/DESIGN.md`,
+"Observability" and "Retry and Fallback".
+
+## Scope / Assignment Status
+
+| Module | Status |
+| --- | --- |
+| Providers (Anthropic + Gemini + OpenAI, normalized contract) | **DONE** |
+| Streaming chat (real SSE, cancellation, persistence, provider switching) | **DONE** |
+| RAG (upload, chunking, embeddings, retrieval, grounded citations) | **DONE** |
+| Tool calling | **CUT** -- provider-level tool-call event normalization exists in all three adapters (`ToolUseStartEvent`/`ToolUseDeltaEvent`/`ToolUseCompleteEvent`); no application-level tool registry or execution loop was built. See `docs/DESIGN.md`. |
+| Observability, cost, retry/fallback/timeout | **DONE** |
+| Multi-tenancy | **DONE** -- structural (RLS), adversarially tested |
+| Security review | **DONE** -- see `docs/DESIGN.md`, "Security"; one disclosed gap (no per-tenant rate limit) |
+| Per-tenant rate limiting / spend cap | **CUT** -- needs shared state (Redis or equivalent), out of scope for this take-home |
+| Reranking, hybrid search, semantic caching, eval framework | **CUT** -- explicitly out of scope |
+| OCR | **CUT** -- scanned PDFs fail extraction honestly rather than silently |
+
+## Known Limitations
 
 - **No OCR.** A scanned/image-only PDF fails extraction honestly
   (`status: "failed"`, a clear reason) rather than silently producing no
@@ -241,50 +293,38 @@ and what production authentication would replace it with.
   explicit instruction not to follow embedded commands -- tested that
   this framing is actually present in what's sent, not that a model will
   necessarily obey it. See `docs/DESIGN.md`, "Prompt Injection".
-- **The similarity threshold default (0.3) is a reasonable take-home
-  starting point, not a calibrated value** -- there's no evaluation
-  dataset behind it. See `docs/DESIGN.md`, "Retrieval".
+- **The similarity threshold default (0.3) is a reasonable starting
+  point, not a calibrated value** -- there's no evaluation dataset
+  behind it.
 - **Chunking is character-based, not token-based**, and context-window
   trimming's token counts are estimates (~4 chars/token) -- both stated
   as approximations, not exact.
 - **No per-tenant rate limiting or spend cap.** Per-request cost is
   bounded (message length, output tokens, upload size), but nothing
-  stops a tenant from sending unlimited requests. Real rate limiting
-  needs shared state (Redis or equivalent), which is explicitly out of
-  scope for this take-home. See `docs/DESIGN.md`, "Security Review".
+  stops a tenant from sending unlimited requests. See `docs/DESIGN.md`,
+  "Security".
 - **Cached-token cost accounting is not implemented.** Reported but not
-  priced into `cost_usd` -- see `docs/DESIGN.md`, "Cost Accounting".
+  priced into `cost_usd` -- see `docs/DESIGN.md`, "Observability".
+- **Gemini and OpenAI chat adapters, and OpenAI embeddings, are
+  fixture-tested only** -- not exercised against a real API in this
+  project. See "Providers" above.
+- **Tool calling is not implemented at the application level** -- see
+  "Scope / Assignment Status".
 
-## Live vs. fixture-tested providers
+## Design Documentation
 
-**Anthropic** has been manually verified against the real API (CP-04): a
-real streamed reply, a real mid-generation Stop, a real auth failure.
-Gemini and OpenAI *chat* adapters are fixture-tested only. See
-`docs/PROVIDER_NOTES.md`'s "Live- vs fixture-tested" note, and its
-"Embeddings" section for the OpenAI embeddings verification status.
+- `docs/DESIGN.md` -- architecture, request flow, every major design
+  decision (with rejected alternatives), multi-tenancy, security,
+  observability, retry/fallback.
+- `docs/PROVIDER_NOTES.md` -- concrete, sourced per-provider API
+  differences (message format, streaming, tool calls, errors, pricing)
+  and how each adapter reconciles them.
+- `docs/AI_USAGE.md` -- how AI assistance was used, reviewed, and
+  corrected during development.
+- `docs/INTERVIEW_NOTES.md` -- prepared talking points and likely
+  debugging questions for presenting this project.
 
-## What is done, partial, and cut so far
-
-**Done:** everything from CP-01 through CP-04 (tenant-isolated
-persistence, real SSE streaming, cancellation, provider switching), plus:
-document upload (PDF/TXT/Markdown) with validation and a configurable
-size limit; deterministic, configurable chunking; an embedding
-abstraction reusing the CP-02 `Provider` interface; tenant/collection-
-scoped vector retrieval with configurable top-k and similarity threshold;
-server-side citation mapping (the model cannot fabricate trusted source
-metadata); a deterministic "I don't know" path when no evidence is
-found, without calling the model; a minimal RAG UI (collection
-management, upload, retrieval settings, inspectable citations). CP-06
-adds: TTFT/latency/token/cost tracking per turn, a tenant-scoped
-`GET /api/usage/summary` endpoint, retry with backoff, config-driven
-fallback chains, per-attempt timeouts, and the explicit
-never-retry-after-visible-output safety boundary.
-
-**Not started (by design -- later checkpoints):** tool execution,
-reranking, hybrid search, semantic caching, an evaluation framework,
-per-tenant rate limiting.
-
-## Repository layout
+## Repository Layout
 
 ```
 polyglot/
@@ -294,20 +334,22 @@ polyglot/
 │       └── components/    Chat, MessageList, ModelSelector, ConversationList, CollectionPanel
 ├── backend/
 │   ├── app/
-│   │   ├── api/            HTTP routes (health, models, conversations, collections)
+│   │   ├── api/            HTTP routes (health, models, conversations, collections, usage)
 │   │   ├── core/            settings, tenant context
 │   │   ├── db/               pool, migrations, seed data
 │   │   ├── providers/     provider-neutral contracts, registries, adapters
-│   │   ├── repositories/  tenant-scoped data access (incl. collections/documents/chunks)
+│   │   ├── repositories/  tenant-scoped data access (conversations, messages,
+│   │   │                    collections, documents, chunks, usage)
 │   │   ├── schemas/         request/response models
-│   │   └── services/         chat orchestration, context-window trimming,
-│   │                            extraction, chunking, embeddings, retrieval, RAG grounding
+│   │   └── services/         chat orchestration, context-window trimming, extraction,
+│   │                            chunking, embeddings, retrieval, RAG grounding, cost, retry
 │   └── tests/
 │       └── rag_fixtures/  hand-built minimal PDFs used by extraction/ingestion tests
 ├── docs/
 │   ├── DESIGN.md
 │   ├── PROVIDER_NOTES.md
-│   └── AI_USAGE.md
+│   ├── AI_USAGE.md
+│   └── INTERVIEW_NOTES.md
 ├── .env.example
 └── README.md
 ```
